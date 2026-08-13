@@ -528,6 +528,7 @@ private:
 #else
         DataCopyPad(finalStateGm_[stateOffset], stateOutLocal, stateOutParams);
 #endif
+        PipeBarrier<PIPE_MTE3>();
         SetFlag<HardEvent::MTE3_V>(evtMte3V_);
     }
 
@@ -567,19 +568,11 @@ private:
         if (realV_ == 0) {
             return;
         }
-        uint64_t nextVOffset = 0;
-        uint32_t nextSingleV = realV_ > vStep_ ? vStep_ : realV_;
-        uint64_t nextStateOffset = ((stateOffset * NV_ + head_i) * realV_) * realK_;
-        PrefetchState(nextStateOffset, nextSingleV);
         for (uint64_t v_i = 0; v_i < realV_; v_i += vStep_) {
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
+            uint64_t curStateOffset = ((stateOffset * NV_ + head_i) * realV_ + v_i) * realK_;
+            PrefetchState(curStateOffset, curSingleV);
             LoadPrefetchedState(curSingleV);
-            nextVOffset = v_i + vStep_;
-            if (nextVOffset < realV_) {
-                nextSingleV = nextVOffset + vStep_ > realV_ ? realV_ - nextVOffset : vStep_;
-                nextStateOffset = ((stateOffset * NV_ + head_i) * realV_ + nextVOffset) * realK_;
-                PrefetchState(nextStateOffset, nextSingleV);
-            }
             evtMte3V_ = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
             evtVMte3_ = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
             SetFlag<HardEvent::MTE3_V>(evtMte3V_);
@@ -597,6 +590,7 @@ private:
                 CopyOutState(curStateOutOffset, curSingleV);
             }
             WaitFlag<HardEvent::MTE3_V>(evtMte3V_);
+            SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
         }
     }
 

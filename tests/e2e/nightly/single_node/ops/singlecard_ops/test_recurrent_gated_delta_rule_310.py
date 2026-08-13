@@ -39,7 +39,16 @@ def npu_recurrent_gated_delta_rule_310(
 
 
 def golden_recurrent_gated_delta_rule(
-    query, key, value, state, beta, scale, actual_seq_lengths, ssm_state_indices, g, num_accepted_tokens
+    query,
+    key,
+    value,
+    state,
+    beta,
+    scale,
+    actual_seq_lengths,
+    ssm_state_indices,
+    g,
+    num_accepted_tokens,
 ):
     q = query.to(torch.float32)
     k = key.to(torch.float32)
@@ -82,6 +91,95 @@ def golden_recurrent_gated_delta_rule(
     return o.to(query.dtype), initial_state.to(query.dtype)
 
 
+def run_recurrent_case(
+    actual_lengths,
+    *,
+    headnum=(4, 8),
+    headdim_k=128,
+    headdim_v=128,
+    with_g=True,
+    accepted_tokens=None,
+    state_indices=None,
+):
+    enable_custom_op()
+    torch.manual_seed(20260813 + sum(actual_lengths))
+    dtype = torch.float16
+    headnum_k, headnum_v = headnum
+    actual_seq_lengths = torch.tensor(actual_lengths, dtype=torch.int32)
+    total_tokens = int(actual_seq_lengths.sum())
+    state = torch.rand(
+        (total_tokens, headnum_v, headdim_v, headdim_k),
+        dtype=dtype,
+    )
+    query = torch.nn.functional.normalize(
+        torch.rand((total_tokens, headnum_k, headdim_k)),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    key = torch.nn.functional.normalize(
+        torch.rand((total_tokens, headnum_k, headdim_k)),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    value = torch.rand((total_tokens, headnum_v, headdim_v), dtype=dtype)
+    g = -torch.rand((total_tokens, headnum_v), dtype=torch.float32) if with_g else None
+    beta = torch.rand((total_tokens, headnum_v), dtype=dtype)
+    ssm_state_indices = (
+        torch.arange(total_tokens, dtype=torch.int32)
+        if state_indices is None
+        else torch.tensor(state_indices, dtype=torch.int32)
+    )
+    accepted = (
+        None
+        if accepted_tokens is None
+        else torch.tensor(accepted_tokens, dtype=torch.int32)
+    )
+    scale = headdim_k**-0.5
+
+    out_golden, state_golden = golden_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        state,
+        beta,
+        scale,
+        actual_seq_lengths,
+        ssm_state_indices,
+        g,
+        accepted,
+    )
+
+    state_npu = state.npu()
+    out = npu_recurrent_gated_delta_rule_310(
+        query.npu(),
+        key.npu(),
+        value.npu(),
+        beta.npu(),
+        state_npu,
+        actual_seq_lengths.npu(),
+        ssm_state_indices.npu(),
+        g=None if g is None else g.npu(),
+        num_accepted_tokens=None if accepted is None else accepted.npu(),
+        scale=scale,
+    )
+
+    atol = 2.5e-2 if max(actual_lengths) > 2 else 1e-2
+    torch.testing.assert_close(
+        out.to(torch.float32).cpu(),
+        out_golden.to(torch.float32).cpu(),
+        rtol=3e-3,
+        atol=atol,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        state_npu.to(torch.float32).cpu(),
+        state_golden.to(torch.float32).cpu(),
+        rtol=3e-3,
+        atol=atol,
+        equal_nan=True,
+    )
+
+
 @pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
 @pytest.mark.parametrize("batch_size", [1, 4, 8])
 @pytest.mark.parametrize("mtp", [1, 2])
@@ -105,7 +203,16 @@ def test_fused_recurrent_gated_delta_rule_310(batch_size, mtp, headnum, headdim_
     scale = headdim_k**-0.5
 
     out_golden, state_golden = golden_recurrent_gated_delta_rule(
-        query, key, value, state, beta, scale, actual_seq_lengths, ssm_state_indices, g, num_accepted_tokens
+        query,
+        key,
+        value,
+        state,
+        beta,
+        scale,
+        actual_seq_lengths,
+        ssm_state_indices,
+        g,
+        num_accepted_tokens,
     )
     out_golden = out_golden.to(torch.float32)
     state_golden = state_golden.to(torch.float32)
@@ -138,4 +245,25 @@ def test_fused_recurrent_gated_delta_rule_310(batch_size, mtp, headnum, headdim_
         rtol=3e-3,
         atol=1e-2,
         equal_nan=True,
+    )
+
+
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+def test_recurrent_multi_v_tile_state_prefetch():
+    run_recurrent_case(
+        [1],
+        headdim_v=512,
+        with_g=False,
+        accepted_tokens=[1],
+    )
+
+
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+def test_recurrent_repeated_state_writeback():
+    run_recurrent_case(
+        [8],
+        headdim_v=512,
+        with_g=False,
+        accepted_tokens=[7],
+        state_indices=[0] * 8,
     )
