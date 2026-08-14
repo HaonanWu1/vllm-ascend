@@ -20,10 +20,15 @@ from contextlib import contextmanager
 import torch
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 import vllm_ascend.sample.rejection_sampler as rejection_sampler_module
 from vllm_ascend._310p.sample.sampler import fill_exponential_310p
+from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
+    capture_dflash_diagnostic,
+    dflash_diagnostic_enabled,
+)
 from vllm_ascend.sample.rejection_sampler import (
     AscendRejectionSampler,
     sample_recovered_tokens_blockwise_pytorch,
@@ -52,6 +57,31 @@ def _force_pytorch_rejection_path(fn):
         rejection_sampler_module.sample_recovered_tokens = original_recovered
 
 
+def _build_verify_diagnostic(
+    metadata: SpecDecodeMetadata,
+    logits: torch.Tensor,
+    output: SamplerOutput,
+) -> dict:
+    raw_target_argmax = logits[metadata.target_logits_indices].argmax(dim=-1)
+    sampled_token_ids = output.sampled_token_ids
+    accepted_draft_counts = (
+        sampled_token_ids.ne(PLACEHOLDER_TOKEN_ID).sum(dim=1) - 1
+    ).clamp(min=0, max=metadata.max_spec_len)
+    positions = torch.arange(
+        metadata.max_spec_len,
+        device=accepted_draft_counts.device,
+    )
+    per_position_accepted = positions.unsqueeze(0) < accepted_draft_counts.unsqueeze(1)
+    return {
+        "draft_token_ids": metadata.draft_token_ids,
+        "num_draft_tokens": metadata.num_draft_tokens,
+        "raw_target_argmax": raw_target_argmax,
+        "sampled_token_ids": sampled_token_ids,
+        "accepted_draft_counts": accepted_draft_counts,
+        "per_position_accepted": per_position_accepted,
+    }
+
+
 class AscendRejectionSampler310(AscendRejectionSampler):
     """310P rejection sampler: PyTorch recovered-token path with CPU RNG (no Triton)."""
 
@@ -63,7 +93,21 @@ class AscendRejectionSampler310(AscendRejectionSampler):
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput:
         with _force_pytorch_rejection_path(self.sample_recovered_tokens):
-            return super().forward(metadata, draft_probs, logits, sampling_metadata)
+            output = super().forward(metadata, draft_probs, logits, sampling_metadata)
+
+        if (
+            getattr(self, "_capture_dflash_diagnostics", False)
+            and dflash_diagnostic_enabled()
+        ):
+            capture_dflash_diagnostic(
+                "verify",
+                payload_builder=lambda: _build_verify_diagnostic(
+                    metadata,
+                    logits,
+                    output,
+                ),
+            )
+        return output
 
     def sample_recovered_tokens(
         self,

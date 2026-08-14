@@ -51,6 +51,10 @@ from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
+from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
+    capture_dflash_diagnostic,
+    dflash_diagnostic_enabled,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
     update_num_computed_tokens_for_batch_change,
@@ -61,6 +65,23 @@ from vllm_ascend.worker.utils import copy_snapshot_to_gpu
 
 _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
+
+
+def _build_state_metadata_diagnostic(result) -> dict | None:
+    per_layer_metadata = result[0]
+    if not isinstance(per_layer_metadata, dict):
+        return None
+    for layer_name, metadata in per_layer_metadata.items():
+        state_indices = getattr(metadata, "spec_state_indices_tensor", None)
+        if state_indices is not None:
+            return {
+                "layer_name": layer_name,
+                "state_indices": state_indices,
+                "num_accepted_tokens": getattr(metadata, "num_accepted_tokens", None),
+                "query_start_loc": getattr(metadata, "spec_query_start_loc", None),
+                "sequence_masks": getattr(metadata, "spec_sequence_masks", None),
+            }
+    return None
 
 
 class NPUModelRunner310(NPUModelRunner):
@@ -103,6 +124,10 @@ class NPUModelRunner310(NPUModelRunner):
         self.sampler = AscendSampler310()
         if getattr(self, "rejection_sampler", None) is not None:
             self.rejection_sampler = AscendRejectionSampler310(self.sampler)
+            self.rejection_sampler._capture_dflash_diagnostics = (
+                self.speculative_config is not None
+                and self.speculative_config.method == "dflash"
+            )
         if self.speculative_config is not None and self.speculative_config.method == "ngram":
             # 310P ngram requires decode-only graph shapes to be built with q_len=1.
             # Keep dispatcher's internal query_len in sync to avoid key-init assert.
@@ -195,7 +220,17 @@ class NPUModelRunner310(NPUModelRunner):
         # 310P must capture SpecDecoding + splitfuse for SpecDecoding uniform decode graphs.
         if self._spec_dummy_capture:
             self.attn_state = AscendAttentionState.SpecDecoding
-        return super()._build_attention_metadata(*args, **kwargs)
+        result = super()._build_attention_metadata(*args, **kwargs)
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dflash"
+            and dflash_diagnostic_enabled()
+        ):
+            capture_dflash_diagnostic(
+                "state_metadata",
+                payload_builder=lambda: _build_state_metadata_diagnostic(result),
+            )
+        return result
 
     def _pad_query_start_loc_for_fia(
         self,

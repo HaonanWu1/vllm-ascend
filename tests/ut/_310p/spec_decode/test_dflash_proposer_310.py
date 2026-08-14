@@ -26,6 +26,7 @@ from vllm_ascend._310p.spec_decode.dflash_proposer_310 import _copy_and_expand_i
 class TestCopyAndExpandInputsAscendC(TestBase):
     def _make_self(self, num_query_total, num_context):
         return SimpleNamespace(
+            method="dflash",
             device=torch.device("cpu"),
             parallel_drafting_token_id=999,
             kernel_block_size=128,
@@ -149,3 +150,61 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             )
 
         self.assertNotIn("sub", recorder.operations)
+
+    def test_copy_path_captures_bounded_diagnostic_inputs(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+
+        with (
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.dflash_diagnostic_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.capture_dflash_diagnostic"
+            ) as capture,
+        ):
+            self._run(
+                fake_self,
+                torch.arange(num_context, dtype=torch.int32),
+                num_context,
+                batch_size=1,
+                num_query_per_req=4,
+                captured={},
+            )
+
+        capture.assert_called_once()
+        (stage,) = capture.call_args.args
+        self.assertEqual(stage, "draft_inputs")
+        payload = capture.call_args.kwargs["payload_builder"]()
+        self.assertEqual(payload["num_context"], num_context)
+        self.assertIn("input_ids", payload)
+        self.assertIn("positions", payload)
+        self.assertIn("query_slots", payload)
+        self.assertIn("context_slots", payload)
+        self.assertIn("block_table", payload)
+
+    def test_copy_path_does_not_capture_for_dspark(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.method = "dspark"
+
+        with (
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.dflash_diagnostic_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.capture_dflash_diagnostic"
+            ) as capture,
+        ):
+            self._run(
+                fake_self,
+                torch.arange(num_context, dtype=torch.int32),
+                num_context,
+                batch_size=1,
+                num_query_per_req=4,
+                captured={},
+            )
+
+        capture.assert_not_called()

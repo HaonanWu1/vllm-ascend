@@ -33,6 +33,10 @@ from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
+    capture_dflash_diagnostic,
+    dflash_diagnostic_enabled,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDsparkProposer
@@ -213,6 +217,24 @@ def _copy_and_expand_inputs_ascendc(
     self._slot_mapping_buffer[:num_query_total].copy_(out_query_slot_mapping[:num_query_total])
     self._context_positions_buffer[:num_context].copy_(out_context_positions[:num_context])
     self._context_slot_mapping_buffer[:num_context].copy_(out_context_slot_mapping[:num_context])
+    if getattr(self, "method", None) == "dflash" and dflash_diagnostic_enabled():
+        capture_dflash_diagnostic(
+            "draft_inputs",
+            payload_builder=lambda: {
+                "num_context": num_context,
+                "num_query_total": num_query_total,
+                "input_ids": self.input_ids[:num_query_total],
+                "positions": self.positions[:num_query_total],
+                "query_slots": self._slot_mapping_buffer[:num_query_total],
+                "context_positions": self._context_positions_buffer[:num_context],
+                "context_slots": self._context_slot_mapping_buffer[:num_context],
+                "query_start_loc": cad.query_start_loc[: batch_size + 1],
+                "seq_lens": cad.seq_lens[:batch_size],
+                "block_table": cad.block_table_tensor[:batch_size],
+                "num_rejected_tokens": num_rejected[:batch_size],
+                "token_indices_to_sample": out_token_indices,
+            },
+        )
     return out_token_indices
 
 

@@ -13,6 +13,8 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,6 +25,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
+    _reset_dflash_diagnostics_for_test,
+)
 
 
 def _prepare_inputs_source() -> str:
@@ -91,6 +96,80 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
+    def test_dflash_attention_metadata_captures_state_indices(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner.speculative_config = SimpleNamespace(method="dflash")
+        gdn_metadata = SimpleNamespace(
+            spec_state_indices_tensor=torch.tensor([[2, 3, 4]]),
+            num_accepted_tokens=torch.tensor([2]),
+            spec_query_start_loc=torch.tensor([0, 3]),
+            spec_sequence_masks=torch.tensor([[True, True, True]]),
+        )
+        result = ({"layer.gdn": gdn_metadata}, SimpleNamespace())
+
+        with (
+            patch(
+                "vllm_ascend._310p.model_runner_310p.NPUModelRunner._build_attention_metadata",
+                return_value=result,
+            ),
+            patch(
+                "vllm_ascend._310p.model_runner_310p.dflash_diagnostic_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend._310p.model_runner_310p.capture_dflash_diagnostic"
+            ) as capture,
+        ):
+            actual = runner._build_attention_metadata()
+
+        self.assertIs(actual, result)
+        capture.assert_called_once()
+        self.assertEqual(capture.call_args.args, ("state_metadata",))
+        payload = capture.call_args.kwargs["payload_builder"]()
+        self.assertEqual(payload["layer_name"], "layer.gdn")
+        torch.testing.assert_close(
+            payload["state_indices"], gdn_metadata.spec_state_indices_tensor
+        )
+        torch.testing.assert_close(
+            payload["num_accepted_tokens"], gdn_metadata.num_accepted_tokens
+        )
+        torch.testing.assert_close(
+            payload["query_start_loc"], gdn_metadata.spec_query_start_loc
+        )
+        torch.testing.assert_close(
+            payload["sequence_masks"], gdn_metadata.spec_sequence_masks
+        )
+
+    def test_dflash_state_diagnostic_failure_preserves_attention_metadata(self):
+        class RaisingMetadata:
+            @property
+            def spec_state_indices_tensor(self):
+                raise RuntimeError("diagnostic-only failure")
+
+        runner = object.__new__(NPUModelRunner310)
+        runner.speculative_config = SimpleNamespace(method="dflash")
+        result = ({"layer.gdn": RaisingMetadata()}, SimpleNamespace())
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.jsonl"
+            env = {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(path)}
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch(
+                    "vllm_ascend._310p.model_runner_310p.NPUModelRunner._build_attention_metadata",
+                    return_value=result,
+                ),
+                patch(
+                    "vllm_ascend._310p.spec_decode.dflash_diagnostics_310.logger.warning_once"
+                ),
+            ):
+                _reset_dflash_diagnostics_for_test()
+                actual = runner._build_attention_metadata()
+            _reset_dflash_diagnostics_for_test()
+
+            self.assertIs(actual, result)
+            self.assertFalse(path.exists())
+
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
         runner.max_num_reqs = 8
