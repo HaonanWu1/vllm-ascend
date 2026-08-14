@@ -45,7 +45,10 @@ class TestPrecomputeContextKv310(TestBase):
 
         context_states = torch.randn(num_ctx, 128)
         context_positions = torch.tensor([10, 11, 12], dtype=torch.int32)
-        slot_mapping = torch.tensor([1, 2, 3], dtype=torch.int32)
+        slot_mapping = [
+            torch.tensor([1, 2, 3], dtype=torch.int32),
+            torch.tensor([129, 130, 131], dtype=torch.int32),
+        ]
 
         # fused_kv output: [num_ctx, L, 2, nkv, hd]
         fused_out = torch.randn(num_ctx, L * 2 * kv)
@@ -75,11 +78,15 @@ class TestPrecomputeContextKv310(TestBase):
         self.assertFalse(AscendRotaryEmbedding310._is_drafting_update_enabled)
         self.assertEqual(layers[0].self_attn.rotary_emb.call_count, 1)
         self.assertEqual(layers[1].self_attn.rotary_emb.call_count, 1)
-        for attn in attn_layers:
+        for layer_index, attn in enumerate(attn_layers):
             attn.impl.do_kv_cache_update.assert_called_once()
             # K passed to the cache update must be the RoPE'd output.
             k_arg = attn.impl.do_kv_cache_update.call_args.args[1]
             self.assertEqual(tuple(k_arg.shape), (num_ctx, nkv, hd))
+            self.assertIs(
+                attn.impl.do_kv_cache_update.call_args.args[4],
+                slot_mapping[layer_index],
+            )
 
     def test_precompute_restores_prior_drafting_flag(self):
         """Flag must be restored to its prior value (True inside _run_merged_draft)."""

@@ -62,6 +62,11 @@ class TestAscendAttentionBackendImpl310(TestBase):
             "vllm_ascend.attention.attention_v1.get_current_vllm_config", return_value=self.mock_vllm_config
         )
         self.config_patcher.start()
+        self.utils_config_patcher = patch(
+            "vllm_ascend.attention.utils.get_current_vllm_config",
+            return_value=self.mock_vllm_config,
+        )
+        self.utils_config_patcher.start()
         self.impl = AscendAttentionBackendImpl310(
             num_heads=8,
             head_size=128,
@@ -255,6 +260,81 @@ class TestAscendAttentionBackendImpl310(TestBase):
             self.impl.forward_impl(query, None, None, None, metadata, output)
             mock_non_causal_mask.assert_called_once()
             mock_npu_paged_attention_splitfuse.assert_called_once()
+
+    def test_dflash_query_cache_write_uses_layer_specific_slots(self):
+        query = torch.randn(4, 8, 128)
+        key = torch.randn(4, 8, 128)
+        value = torch.randn(4, 8, 128)
+        output = torch.empty_like(query)
+        key_cache = torch.zeros(2, 64, 8, 128)
+        value_cache = torch.zeros_like(key_cache)
+        original_slots = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+        layer_slots = torch.tensor([65, 66, 67, 68], dtype=torch.int32)
+        metadata = MagicMock()
+        metadata.num_actual_tokens = 4
+        metadata.causal = False
+        metadata.slot_mapping = original_slots
+        self.impl._dflash_query_slot_mapping_310 = layer_slots
+
+        with (
+            patch(
+                "vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache"
+            ) as reshape_and_cache,
+            patch(
+                "vllm_ascend.attention.attention_v1.notify_kv_cache_written"
+            ),
+        ):
+            self.impl.reshape_and_cache(
+                query,
+                key,
+                value,
+                (key_cache, value_cache),
+                metadata,
+                output,
+            )
+
+        reshape_and_cache.assert_called_once()
+        torch.testing.assert_close(
+            reshape_and_cache.call_args.kwargs["slot_mapping"],
+            layer_slots,
+        )
+        self.assertIs(metadata.slot_mapping, original_slots)
+
+    def test_cache_write_without_dflash_override_uses_original_slots(self):
+        query = torch.randn(2, 8, 128)
+        key = torch.randn(2, 8, 128)
+        value = torch.randn(2, 8, 128)
+        output = torch.empty_like(query)
+        key_cache = torch.zeros(2, 64, 8, 128)
+        value_cache = torch.zeros_like(key_cache)
+        original_slots = torch.tensor([1, 2], dtype=torch.int32)
+        metadata = MagicMock()
+        metadata.num_actual_tokens = 2
+        metadata.causal = False
+        metadata.slot_mapping = original_slots
+
+        with (
+            patch(
+                "vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache"
+            ) as reshape_and_cache,
+            patch(
+                "vllm_ascend.attention.attention_v1.notify_kv_cache_written"
+            ),
+        ):
+            self.impl.reshape_and_cache(
+                query,
+                key,
+                value,
+                (key_cache, value_cache),
+                metadata,
+                output,
+            )
+
+        reshape_and_cache.assert_called_once()
+        self.assertEqual(
+            reshape_and_cache.call_args.kwargs["slot_mapping"].data_ptr(),
+            original_slots.data_ptr(),
+        )
 
     @patch("torch_npu._npu_paged_attention", create=True)
     @patch("torch_npu._npu_reshape_and_cache")

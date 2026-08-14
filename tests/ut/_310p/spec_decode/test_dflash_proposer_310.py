@@ -20,7 +20,10 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from tests.ut.base import TestBase
-from vllm_ascend._310p.spec_decode.dflash_proposer_310 import _copy_and_expand_inputs_ascendc
+from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+    AscendDflashProposer310,
+    _copy_and_expand_inputs_ascendc,
+)
 
 
 class TestCopyAndExpandInputsAscendC(TestBase):
@@ -51,14 +54,28 @@ class TestCopyAndExpandInputsAscendC(TestBase):
 
         def fake_op(next_token_ids, tpos, *args, **kwargs):
             captured["tpos"] = tpos
+            block_size = int(args[6])
+            captured.setdefault("block_sizes", []).append(block_size)
             n = tpos.shape[0]
-            context_slots = captured.get(
-                "op_context_slots", torch.zeros(n, dtype=torch.int32)
+            context_slots_by_block = captured.get(
+                "op_context_slots_by_block", {}
+            )
+            context_slots = context_slots_by_block.get(
+                block_size,
+                captured.get(
+                    "op_context_slots",
+                    torch.zeros(n, dtype=torch.int32),
+                ),
             ).clone()
+            query_slots = torch.full(
+                (num_query_total,),
+                block_size + 1000,
+                dtype=torch.int32,
+            )
             return (
                 torch.zeros(num_query_total, dtype=torch.int32),
                 torch.zeros(num_query_total, dtype=torch.int32),
-                torch.zeros(num_query_total, dtype=torch.int32),
+                query_slots,
                 torch.arange(n, dtype=torch.int32),
                 context_slots,
                 torch.zeros(batch_size * 3, dtype=torch.int32),
@@ -137,6 +154,12 @@ class TestCopyAndExpandInputsAscendC(TestBase):
 
         num_context = 12
         fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.kernel_block_size = 64
+        fake_self.attn_layer_names = ["layer.0", "layer.1"]
+        fake_self._dflash_layer_block_sizes_310 = {
+            "layer.0": 64,
+            "layer.1": 128,
+        }
         recorder = OpRecorder()
 
         with recorder:
@@ -150,6 +173,278 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             )
 
         self.assertNotIn("sub", recorder.operations)
+
+    def test_uniform_cache_layout_calls_custom_op_once(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.kernel_block_size = 64
+        fake_self.attn_layer_names = ["layer.0", "layer.1", "layer.2"]
+        fake_self._dflash_layer_block_sizes_310 = {
+            "layer.0": 64,
+            "layer.1": 64,
+            "layer.2": 64,
+        }
+        captured = {}
+
+        self._run(
+            fake_self,
+            torch.arange(num_context, dtype=torch.int32),
+            num_context,
+            batch_size=1,
+            num_query_per_req=4,
+            captured=captured,
+        )
+
+        self.assertEqual(captured["block_sizes"], [64])
+        self.assertEqual(
+            len(fake_self._dflash_context_slot_mapping_by_layer_310),
+            3,
+        )
+        self.assertEqual(
+            len(fake_self._dflash_query_slot_mapping_by_layer_310),
+            3,
+        )
+
+    def test_heterogeneous_cache_layouts_keep_per_layer_slots(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.kernel_block_size = 64
+        fake_self.attn_layer_names = ["layer.0", "layer.1", "layer.2"]
+        fake_self._dflash_layer_block_sizes_310 = {
+            "layer.0": 64,
+            "layer.1": 64,
+            "layer.2": 128,
+        }
+        context_64 = torch.arange(64, 64 + num_context, dtype=torch.int32)
+        context_128 = torch.arange(128, 128 + num_context, dtype=torch.int32)
+        captured = {
+            "op_context_slots_by_block": {
+                64: context_64,
+                128: context_128,
+            }
+        }
+
+        self._run(
+            fake_self,
+            torch.arange(num_context, dtype=torch.int32),
+            num_context,
+            batch_size=1,
+            num_query_per_req=4,
+            captured=captured,
+        )
+
+        self.assertEqual(captured["block_sizes"], [64, 128])
+        context_by_layer = fake_self._dflash_context_slot_mapping_by_layer_310
+        query_by_layer = fake_self._dflash_query_slot_mapping_by_layer_310
+        torch.testing.assert_close(context_by_layer[0], context_64)
+        torch.testing.assert_close(context_by_layer[1], context_64)
+        torch.testing.assert_close(context_by_layer[2], context_128)
+        torch.testing.assert_close(
+            query_by_layer[0],
+            torch.full((4,), 1064, dtype=torch.int32),
+        )
+        torch.testing.assert_close(query_by_layer[1], query_by_layer[0])
+        torch.testing.assert_close(
+            query_by_layer[2],
+            torch.full((4,), 1128, dtype=torch.int32),
+        )
+
+    def test_qwen_cache_shapes_are_discovered_and_bound_per_layer(self):
+        num_context = 12
+        layer_names = [
+            f"model.layers.{layer_index}.self_attn.attn"
+            for layer_index in range(24, 29)
+        ]
+        physical_shapes = [
+            (22840, 32, 64, 16),
+            (22840, 32, 64, 16),
+            (22840, 32, 64, 16),
+            (11420, 32, 128, 16),
+            (11420, 32, 128, 16),
+        ]
+        layers = {
+            layer_name: SimpleNamespace(
+                kv_cache=[
+                    SimpleNamespace(
+                        shape=shape,
+                        dim=lambda shape=shape: len(shape),
+                    )
+                ]
+            )
+            for layer_name, shape in zip(layer_names, physical_shapes)
+        }
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self._kernel_block_size_fixed_310 = False
+        fake_self.vllm_config = object()
+        fake_self.attn_layer_names = layer_names
+        context_64 = torch.arange(64, 64 + num_context, dtype=torch.int32)
+        context_128 = torch.arange(128, 128 + num_context, dtype=torch.int32)
+        captured = {
+            "op_context_slots_by_block": {
+                64: context_64,
+                128: context_128,
+            }
+        }
+
+        with patch(
+            "vllm.config.get_layers_from_vllm_config",
+            return_value=layers,
+        ):
+            self._run(
+                fake_self,
+                torch.arange(num_context, dtype=torch.int32),
+                num_context,
+                batch_size=1,
+                num_query_per_req=4,
+                captured=captured,
+            )
+
+        self.assertEqual(fake_self.kernel_block_size, 64)
+        self.assertEqual(
+            fake_self._dflash_layer_block_sizes_310,
+            dict(zip(layer_names, [64, 64, 64, 128, 128])),
+        )
+        self.assertEqual(captured["block_sizes"], [64, 128])
+        context_by_layer = fake_self._dflash_context_slot_mapping_by_layer_310
+        query_by_layer = fake_self._dflash_query_slot_mapping_by_layer_310
+        self.assertEqual(len(context_by_layer), 5)
+        self.assertEqual(len(query_by_layer), 5)
+        for layer_index in range(3):
+            torch.testing.assert_close(context_by_layer[layer_index], context_64)
+            torch.testing.assert_close(
+                query_by_layer[layer_index],
+                torch.full((4,), 1064, dtype=torch.int32),
+            )
+        for layer_index in range(3, 5):
+            torch.testing.assert_close(context_by_layer[layer_index], context_128)
+            torch.testing.assert_close(
+                query_by_layer[layer_index],
+                torch.full((4,), 1128, dtype=torch.int32),
+            )
+
+        attention_layers = [
+            SimpleNamespace(impl=SimpleNamespace()) for _ in layer_names
+        ]
+        model = MagicMock()
+        model.model = SimpleNamespace(_attn_layers=attention_layers)
+        fake_self._dflash_num_context = num_context
+        fake_self._dflash_hidden_states = torch.randn(num_context, 8)
+        fake_self.model = model
+        AscendDflashProposer310.build_model_inputs_first_pass(
+            fake_self,
+            num_input_tokens=4,
+        )
+
+        precompute_call = model.precompute_and_store_context_kv.call_args
+        self.assertIs(precompute_call.args[2], context_by_layer)
+        for layer_index, attention in enumerate(attention_layers):
+            self.assertIs(
+                attention.impl._dflash_query_slot_mapping_310,
+                query_by_layer[layer_index],
+            )
+
+    def test_heterogeneous_slot_buffers_are_allocated_once(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.kernel_block_size = 64
+        fake_self.attn_layer_names = ["layer.0", "layer.1"]
+        fake_self._dflash_layer_block_sizes_310 = {
+            "layer.0": 64,
+            "layer.1": 128,
+        }
+
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310.torch.empty_like",
+            wraps=torch.empty_like,
+        ) as empty_like:
+            for _ in range(2):
+                self._run(
+                    fake_self,
+                    torch.arange(num_context, dtype=torch.int32),
+                    num_context,
+                    batch_size=1,
+                    num_query_per_req=4,
+                    captured={},
+                )
+
+        # One persistent context buffer and one persistent query buffer are
+        # needed for the secondary layout; replay must reuse both.
+        self.assertEqual(empty_like.call_count, 2)
+
+    def test_dspark_does_not_create_dflash_layout_state(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.method = "dspark"
+        captured = {}
+
+        self._run(
+            fake_self,
+            torch.arange(num_context, dtype=torch.int32),
+            num_context,
+            batch_size=1,
+            num_query_per_req=4,
+            captured=captured,
+        )
+
+        self.assertEqual(captured["block_sizes"], [128])
+        self.assertFalse(
+            hasattr(fake_self, "_dflash_context_slot_buffers_by_size_310")
+        )
+        self.assertFalse(
+            hasattr(fake_self, "_dflash_query_slot_buffers_by_size_310")
+        )
+
+    def test_per_layer_slots_are_bound_to_context_and_query_writes(self):
+        context_by_layer = [
+            torch.tensor([64, 65], dtype=torch.int32),
+            torch.tensor([128, 129], dtype=torch.int32),
+        ]
+        query_by_layer = [
+            torch.tensor([66, 67, 68, 69], dtype=torch.int32),
+            torch.tensor([130, 131, 132, 133], dtype=torch.int32),
+        ]
+        attention_layers = [
+            SimpleNamespace(impl=SimpleNamespace()),
+            SimpleNamespace(impl=SimpleNamespace()),
+        ]
+        model = MagicMock()
+        model.model = SimpleNamespace(_attn_layers=attention_layers)
+        fake_self = SimpleNamespace(
+            _dflash_num_context=2,
+            _dflash_hidden_states=torch.randn(2, 8),
+            _context_positions_buffer=torch.tensor([10, 11], dtype=torch.int32),
+            _context_slot_mapping_buffer=torch.tensor([1, 2], dtype=torch.int32),
+            _dflash_context_slot_mapping_by_layer_310=context_by_layer,
+            _dflash_query_slot_mapping_by_layer_310=query_by_layer,
+            input_ids=torch.tensor([5, 6, 7, 8], dtype=torch.int32),
+            positions=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+            model=model,
+        )
+
+        result = AscendDflashProposer310.build_model_inputs_first_pass(
+            fake_self,
+            num_input_tokens=4,
+        )
+
+        model.precompute_and_store_context_kv.assert_called_once()
+        call = model.precompute_and_store_context_kv.call_args
+        self.assertIs(call.args[2], context_by_layer)
+        self.assertIs(
+            attention_layers[0].impl._dflash_query_slot_mapping_310,
+            query_by_layer[0],
+        )
+        self.assertIs(
+            attention_layers[1].impl._dflash_query_slot_mapping_310,
+            query_by_layer[1],
+        )
+        self.assertEqual(
+            result["input_ids"].data_ptr(),
+            fake_self.input_ids.data_ptr(),
+        )
+        self.assertEqual(
+            result["positions"].data_ptr(),
+            fake_self.positions.data_ptr(),
+        )
 
     def test_copy_path_captures_bounded_diagnostic_inputs(self):
         num_context = 12

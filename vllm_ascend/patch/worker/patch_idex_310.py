@@ -43,6 +43,9 @@ AscendSpecDecodeBaseProposer._run_merged_draft = (  # type: ignore[method-assign
 AscendDflashProposer.set_inputs_first_pass = (  # type: ignore[method-assign]
     AscendDflashProposer310.set_inputs_first_pass
 )
+AscendDflashProposer.build_model_inputs_first_pass = (  # type: ignore[method-assign]
+    AscendDflashProposer310.build_model_inputs_first_pass
+)
 AscendDsparkProposer.set_inputs_first_pass = (  # type: ignore[method-assign]
     AscendDsparkProposer310.set_inputs_first_pass
 )

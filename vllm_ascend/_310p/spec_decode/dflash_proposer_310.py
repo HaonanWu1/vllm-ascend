@@ -52,30 +52,64 @@ from vllm_ascend.spec_decode.dspark_proposer import AscendDsparkProposer
 MAX_RELIABLE_NUM_SPEC_TOKENS_310P = 7
 
 
-def _draft_cache_block_size_310(proposer: Any) -> int | None:
-    """Read the block_size actually used by the allocated draft KV cache.
+def _draft_cache_block_sizes_310(proposer: Any) -> dict[str, int]:
+    """Read the physical block size used by every allocated draft KV cache.
 
     The draft ``kv_cache_spec.block_size`` (e.g. 640) is split into kernel
-    sub-blocks when the KV cache is allocated (310P NZ layout
-    ``(2, num_blocks, (nkv*hd)//16, block_size, 16)``), so the real per-block
-    size is the tensor's ``shape[-2]`` (e.g. 64) - NOT
-    ``get_supported_kernel_block_sizes()[0]`` (128) that the base proposer used.
-    The block_table is expressed in these kernel blocks too, so slot mapping
-    must use this size or SplitFuse reads empty blocks (all-zero draft output).
+    sub-blocks when the KV cache is allocated. Hybrid cache groups can assign
+    different physical block sizes to different draft layers, so one global
+    slot mapping is not sufficient.
     """
     from vllm.config import get_layers_from_vllm_config
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
     layers = get_layers_from_vllm_config(proposer.vllm_config, AttentionLayerBase)
-    layer = layers[proposer.attn_layer_names[0]]
-    cache = getattr(layer, "kv_cache", None)
-    # kv_cache is list[per-virtual-engine]; each entry may be a (k, v) tuple or a
-    # single stacked tensor. Unwrap to the first real tensor.
-    while isinstance(cache, (list, tuple)) and len(cache) > 0:
-        cache = cache[0]
-    if cache is None or not hasattr(cache, "shape") or cache.dim() < 2:
-        return None
-    return int(cache.shape[-2])
+    block_sizes: dict[str, int] = {}
+    for layer_name in proposer.attn_layer_names:
+        cache = getattr(layers[layer_name], "kv_cache", None)
+        # kv_cache is list[per-virtual-engine]; each entry may be a (k, v)
+        # tuple or a single stacked tensor. Unwrap to the first real tensor.
+        while isinstance(cache, (list, tuple)) and len(cache) > 0:
+            cache = cache[0]
+        if cache is not None and hasattr(cache, "shape") and cache.dim() >= 2:
+            block_sizes[layer_name] = int(cache.shape[-2])
+    return block_sizes
+
+
+def _get_dflash_slot_buffers_by_size_310(
+    proposer: Any,
+    block_sizes: list[int],
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    """Return persistent context/query slot buffers for each cache layout."""
+    context_buffers = getattr(
+        proposer,
+        "_dflash_context_slot_buffers_by_size_310",
+        None,
+    )
+    query_buffers = getattr(
+        proposer,
+        "_dflash_query_slot_buffers_by_size_310",
+        None,
+    )
+    if context_buffers is None or query_buffers is None:
+        context_buffers = {}
+        query_buffers = {}
+    for block_size in block_sizes:
+        if block_size == proposer.kernel_block_size:
+            context_buffers[block_size] = proposer._context_slot_mapping_buffer
+            query_buffers[block_size] = proposer._slot_mapping_buffer
+        else:
+            if block_size not in context_buffers:
+                context_buffers[block_size] = torch.empty_like(
+                    proposer._context_slot_mapping_buffer
+                )
+            if block_size not in query_buffers:
+                query_buffers[block_size] = torch.empty_like(
+                    proposer._slot_mapping_buffer
+                )
+    proposer._dflash_context_slot_buffers_by_size_310 = context_buffers
+    proposer._dflash_query_slot_buffers_by_size_310 = query_buffers
+    return context_buffers, query_buffers
 
 
 def _ensure_kernel_block_size_matches_cache_310(proposer: Any) -> None:
@@ -109,7 +143,9 @@ def _ensure_kernel_block_size_matches_cache_310(proposer: Any) -> None:
 
     current = getattr(proposer, "kernel_block_size", None)
     try:
-        cache_block_size = _draft_cache_block_size_310(proposer)
+        block_sizes = _draft_cache_block_sizes_310(proposer)
+        proposer._dflash_layer_block_sizes_310 = block_sizes
+        cache_block_size = block_sizes.get(proposer.attn_layer_names[0])
         if cache_block_size and cache_block_size != current:
             proposer.kernel_block_size = cache_block_size
             logger.info(
@@ -188,35 +224,85 @@ def _copy_and_expand_inputs_ascendc(
         # has no rejection info we feed an all-zero one.
         num_rejected = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
 
-    (
-        out_input_ids,
-        out_query_positions,
-        out_query_slot_mapping,
-        out_context_positions,
-        out_context_slot_mapping,
-        out_token_indices,
-    ) = torch.ops._C_ascend.npu_copy_and_expand_dflash_inputs(
-        next_token_ids.to(torch.int32),
-        target_positions.to(torch.int32),
-        cad.slot_mapping.to(torch.int32),
-        cad.query_start_loc.to(torch.int32),
-        cad.seq_lens.to(torch.int32),
-        cad.block_table_tensor.to(torch.int32),
-        num_rejected,
-        int(self.parallel_drafting_token_id),
-        int(self.kernel_block_size),
-        int(num_query_per_req),
-        int(self.num_speculative_tokens),
-        bool(sample_from_anchor),
-    )
-
     num_query_total = batch_size * num_query_per_req
+    layer_block_sizes = getattr(
+        self,
+        "_dflash_layer_block_sizes_310",
+        {},
+    )
+    block_sizes = [int(self.kernel_block_size)]
+    if self.method == "dflash":
+        for layer_name in getattr(self, "attn_layer_names", []):
+            block_size = layer_block_sizes.get(layer_name)
+            if block_size is not None and block_size not in block_sizes:
+                block_sizes.append(block_size)
+    if self.method == "dflash":
+        context_buffers, query_buffers = _get_dflash_slot_buffers_by_size_310(
+            self,
+            block_sizes,
+        )
+    else:
+        # DSpark continues to use its original single global layout and does
+        # not acquire any DFlash-only persistent state.
+        context_buffers = {
+            int(self.kernel_block_size): self._context_slot_mapping_buffer
+        }
+        query_buffers = {
+            int(self.kernel_block_size): self._slot_mapping_buffer
+        }
 
-    self.input_ids[:num_query_total].copy_(out_input_ids[:num_query_total])
-    self.positions[:num_query_total].copy_(out_query_positions[:num_query_total])
-    self._slot_mapping_buffer[:num_query_total].copy_(out_query_slot_mapping[:num_query_total])
-    self._context_positions_buffer[:num_context].copy_(out_context_positions[:num_context])
-    self._context_slot_mapping_buffer[:num_context].copy_(out_context_slot_mapping[:num_context])
+    out_token_indices = None
+    for layout_index, block_size in enumerate(block_sizes):
+        (
+            out_input_ids,
+            out_query_positions,
+            out_query_slot_mapping,
+            out_context_positions,
+            out_context_slot_mapping,
+            layout_token_indices,
+        ) = torch.ops._C_ascend.npu_copy_and_expand_dflash_inputs(
+            next_token_ids.to(torch.int32),
+            target_positions.to(torch.int32),
+            cad.slot_mapping.to(torch.int32),
+            cad.query_start_loc.to(torch.int32),
+            cad.seq_lens.to(torch.int32),
+            cad.block_table_tensor.to(torch.int32),
+            num_rejected,
+            int(self.parallel_drafting_token_id),
+            int(block_size),
+            int(num_query_per_req),
+            int(self.num_speculative_tokens),
+            bool(sample_from_anchor),
+        )
+        query_buffers[block_size][:num_query_total].copy_(
+            out_query_slot_mapping[:num_query_total]
+        )
+        context_buffers[block_size][:num_context].copy_(
+            out_context_slot_mapping[:num_context]
+        )
+        if layout_index == 0:
+            self.input_ids[:num_query_total].copy_(
+                out_input_ids[:num_query_total]
+            )
+            self.positions[:num_query_total].copy_(
+                out_query_positions[:num_query_total]
+            )
+            self._context_positions_buffer[:num_context].copy_(
+                out_context_positions[:num_context]
+            )
+            out_token_indices = layout_token_indices
+
+    if self.method == "dflash" and layer_block_sizes:
+        self._dflash_context_slot_mapping_by_layer_310 = [
+            context_buffers[layer_block_sizes[layer_name]][:num_context]
+            for layer_name in self.attn_layer_names
+        ]
+        self._dflash_query_slot_mapping_by_layer_310 = [
+            query_buffers[layer_block_sizes[layer_name]][:num_query_total]
+            for layer_name in self.attn_layer_names
+        ]
+
+    assert out_token_indices is not None
     if getattr(self, "method", None) == "dflash" and dflash_diagnostic_enabled():
         capture_dflash_diagnostic(
             "draft_inputs",
@@ -240,6 +326,49 @@ def _copy_and_expand_inputs_ascendc(
 
 class AscendDflashProposer310(AscendDflashProposer):
     """310P dflash proposer: builds inputs with the AscendC op (no Triton)."""
+
+    def build_model_inputs_first_pass(
+        self,
+        num_input_tokens: int,
+    ) -> dict[str, Any]:
+        """Bind context/query slots to each physical draft cache layout."""
+        num_context = self._dflash_num_context
+        context_slot_mapping = getattr(
+            self,
+            "_dflash_context_slot_mapping_by_layer_310",
+            self._context_slot_mapping_buffer[:num_context],
+        )
+        query_slot_mapping = getattr(
+            self,
+            "_dflash_query_slot_mapping_by_layer_310",
+            None,
+        )
+        if query_slot_mapping is not None:
+            draft_model = getattr(self.model, "model", None)
+            attention_layers = getattr(draft_model, "_attn_layers", None)
+            if attention_layers is None or len(attention_layers) != len(
+                query_slot_mapping
+            ):
+                raise RuntimeError(
+                    "310P DFlash per-layer query slots do not match the "
+                    "allocated draft attention layers."
+                )
+            for attention, layer_slots in zip(
+                attention_layers,
+                query_slot_mapping,
+            ):
+                attention.impl._dflash_query_slot_mapping_310 = layer_slots
+
+        self.model.precompute_and_store_context_kv(
+            self._dflash_hidden_states[:num_context],
+            self._context_positions_buffer[:num_context],
+            context_slot_mapping,
+        )
+        return dict(
+            input_ids=self.input_ids[:num_input_tokens],
+            positions=self.positions[:num_input_tokens],
+            inputs_embeds=None,
+        )
 
     def set_inputs_first_pass(
         self,

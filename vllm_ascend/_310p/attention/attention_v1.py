@@ -108,6 +108,45 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         super().__init__(*args, **kwargs)
         self.support_compressed_mask = is_compressed_mask_supported()
 
+    def reshape_and_cache(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ):
+        """Use a DFlash layer's physical-layout slot mapping when present."""
+        layer_slots = getattr(
+            self,
+            "_dflash_query_slot_mapping_310",
+            None,
+        )
+        if layer_slots is None or getattr(attn_metadata, "causal", True):
+            return super().reshape_and_cache(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
+
+        original_slots = attn_metadata.slot_mapping
+        attn_metadata.slot_mapping = layer_slots
+        try:
+            return super().reshape_and_cache(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
+        finally:
+            attn_metadata.slot_mapping = original_slots
+
     def _flash_attention(
         self,
         query: torch.Tensor,
