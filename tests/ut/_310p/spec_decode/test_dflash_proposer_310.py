@@ -23,7 +23,56 @@ from tests.ut.base import TestBase
 from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
     AscendDflashProposer310,
     _copy_and_expand_inputs_ascendc,
+    _ensure_kernel_block_size_matches_cache_310,
 )
+
+
+class TestDflashCapabilityWarning310(TestBase):
+    @staticmethod
+    def _make_proposer(method: str, num_speculative_tokens: int):
+        return SimpleNamespace(
+            method=method,
+            num_speculative_tokens=num_speculative_tokens,
+            kernel_block_size=128,
+            _kernel_block_size_fixed_310=False,
+            attn_layer_names=["layer.0"],
+            vllm_config=object(),
+        )
+
+    def _run(self, method: str, num_speculative_tokens: int):
+        proposer = self._make_proposer(method, num_speculative_tokens)
+        with (
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+                "_draft_cache_block_sizes_310",
+                return_value={"layer.0": 128},
+            ),
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+                "logger.warning"
+            ) as warning,
+        ):
+            _ensure_kernel_block_size_matches_cache_310(proposer)
+        return warning
+
+    def test_dflash_k15_is_within_validated_capability(self):
+        warning = self._run("dflash", 15)
+
+        warning.assert_not_called()
+
+    def test_dflash_above_k15_warns_without_claiming_corruption(self):
+        warning = self._run("dflash", 16)
+
+        warning.assert_called_once()
+        message, requested, validated = warning.call_args.args
+        self.assertIn("not validated", message)
+        self.assertNotIn("corrupt", message)
+        self.assertEqual((requested, validated), (16, 15))
+
+    def test_dspark_does_not_inherit_dflash_capability_warning(self):
+        warning = self._run("dspark", 16)
+
+        warning.assert_not_called()
 
 
 class TestCopyAndExpandInputsAscendC(TestBase):
