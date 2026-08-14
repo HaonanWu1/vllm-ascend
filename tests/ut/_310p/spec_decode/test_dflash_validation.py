@@ -41,9 +41,178 @@ def test_validation_profiles_fix_workload_and_models() -> None:
     assert MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"].draft == (
         "/home/models/Qwen3.6-35B-A3B-DFlash"
     )
+    assert MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"].tensor_parallel_size == 2
+    assert MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"].draft_tensor_parallel_size == 2
+    assert MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"].quantization == "ascend"
+    assert MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"].enable_expert_parallel is False
+    assert MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"].expected_target_revision == (
+        "1a118d717bcbd59480f4a110fe22181d21711b4d"
+    )
+    assert MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"].expected_draft_revision == (
+        "74911aca0cf3156587f4d198b18857e553657cd6"
+    )
     assert RUN_PROFILES["eager"].enforce_eager is True
     assert RUN_PROFILES["target-only"].uses_dflash is False
     assert all(profile.temperature == 0 for profile in RUN_PROFILES.values())
+
+
+def test_qwen36_profile_forwards_w8a8_tp_without_ep_and_draft_settings(
+    monkeypatch,
+) -> None:
+    import vllm
+
+    calls = []
+
+    def fake_llm(**kwargs):
+        calls.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(vllm, "LLM", fake_llm)
+    profile = MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"]
+    workload = SimpleNamespace(max_model_len=4096, max_num_seqs=1)
+
+    dflash_validation._build_llm(
+        profile,
+        RUN_PROFILES["target-only"],
+        workload,
+    )
+    dflash_validation._build_llm(
+        profile,
+        RUN_PROFILES["eager"],
+        workload,
+    )
+    qwen35_profile = MODEL_PROFILES["qwen3.5-2b"]
+    dflash_validation._build_llm(
+        qwen35_profile,
+        RUN_PROFILES["target-only"],
+        workload,
+    )
+    dflash_validation._build_llm(
+        qwen35_profile,
+        RUN_PROFILES["eager"],
+        workload,
+    )
+
+    target_kwargs, dflash_kwargs, qwen35_target_kwargs, qwen35_dflash_kwargs = calls
+    assert target_kwargs["tensor_parallel_size"] == 2
+    assert target_kwargs["quantization"] == "ascend"
+    assert "enable_expert_parallel" not in target_kwargs
+    assert target_kwargs["trust_remote_code"] is True
+    assert "speculative_config" not in target_kwargs
+    for field in (
+        "tensor_parallel_size",
+        "quantization",
+        "trust_remote_code",
+    ):
+        assert dflash_kwargs[field] == target_kwargs[field]
+    assert "enable_expert_parallel" not in dflash_kwargs
+    assert dflash_kwargs["speculative_config"] == {
+        "method": "dflash",
+        "model": "/home/models/Qwen3.6-35B-A3B-DFlash",
+        "num_speculative_tokens": 15,
+        "draft_tensor_parallel_size": 2,
+    }
+    for kwargs in (qwen35_target_kwargs, qwen35_dflash_kwargs):
+        assert kwargs["tensor_parallel_size"] == 1
+        assert "quantization" not in kwargs
+        assert "enable_expert_parallel" not in kwargs
+        assert "trust_remote_code" not in kwargs
+    assert "speculative_config" not in qwen35_target_kwargs
+    assert qwen35_dflash_kwargs["speculative_config"] == {
+        "method": "dflash",
+        "model": "/home/models/Qwen3.5-2B-Dflash",
+        "num_speculative_tokens": 15,
+    }
+
+
+def test_model_runtime_report_records_qwen36_and_preserves_qwen35() -> None:
+    qwen36 = dflash_validation._model_runtime_configuration(
+        MODEL_PROFILES["qwen3.6-35b-a3b-w8a8"],
+        RUN_PROFILES["eager"],
+    )
+    qwen35 = dflash_validation._model_runtime_configuration(
+        MODEL_PROFILES["qwen3.5-2b"],
+        RUN_PROFILES["target-only"],
+    )
+
+    assert qwen36 == {
+        "tensor_parallel_size": 2,
+        "draft_tensor_parallel_size": 2,
+        "dtype": "float16",
+        "quantization": "ascend",
+        "enable_expert_parallel": False,
+        "trust_remote_code": True,
+    }
+    assert qwen35 == {
+        "tensor_parallel_size": 1,
+        "draft_tensor_parallel_size": None,
+        "dtype": "float16",
+        "quantization": None,
+        "enable_expert_parallel": False,
+        "trust_remote_code": False,
+    }
+
+
+def test_run_validation_includes_qwen36_runtime_configuration(
+    monkeypatch,
+) -> None:
+    import torch
+
+    workload = SimpleNamespace(
+        name="mixed-short",
+        warmup_prompts=["warmup"],
+        measured_prompts=["measured"],
+        max_output_tokens=1,
+        max_model_len=128,
+        max_num_seqs=1,
+        sequential=False,
+        metadata={},
+    )
+    output = SimpleNamespace(
+        outputs=[SimpleNamespace(token_ids=[123], text="ok")],
+    )
+    llm = SimpleNamespace(get_metrics=lambda: [])
+
+    monkeypatch.setattr(
+        dflash_validation,
+        "_build_workload",
+        lambda *_args: workload,
+    )
+    monkeypatch.setattr(
+        dflash_validation,
+        "_build_llm",
+        lambda *_args: llm,
+    )
+    monkeypatch.setattr(
+        dflash_validation,
+        "_generate",
+        lambda *_args, **_kwargs: [output],
+    )
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+
+    configuration = dflash_validation.run_validation(
+        "qwen3.6-35b-a3b-w8a8",
+        "target-only",
+    )["configuration"]
+
+    assert {
+        field: configuration[field]
+        for field in (
+            "tensor_parallel_size",
+            "draft_tensor_parallel_size",
+            "dtype",
+            "quantization",
+            "enable_expert_parallel",
+            "trust_remote_code",
+        )
+    } == {
+        "tensor_parallel_size": 2,
+        "draft_tensor_parallel_size": None,
+        "dtype": "float16",
+        "quantization": "ascend",
+        "enable_expert_parallel": False,
+        "trust_remote_code": True,
+    }
 
 
 def test_math500_workload_reserves_warmup_and_formats_official_prompt(

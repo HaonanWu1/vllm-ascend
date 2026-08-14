@@ -197,7 +197,11 @@ class ModelProfile:
     target: str
     draft: str
     tensor_parallel_size: int = 1
+    draft_tensor_parallel_size: int | None = None
     dtype: str = "float16"
+    quantization: str | None = None
+    enable_expert_parallel: bool = False
+    trust_remote_code: bool = False
     expected_target_revision: str | None = None
     expected_draft_revision: str | None = None
 
@@ -227,6 +231,12 @@ MODEL_PROFILES = {
     "qwen3.6-35b-a3b-w8a8": ModelProfile(
         target="/home/models/Qwen3.6-35B-A3B-w8a8",
         draft="/home/models/Qwen3.6-35B-A3B-DFlash",
+        tensor_parallel_size=2,
+        draft_tensor_parallel_size=2,
+        quantization="ascend",
+        trust_remote_code=True,
+        expected_target_revision="1a118d717bcbd59480f4a110fe22181d21711b4d",
+        expected_draft_revision="74911aca0cf3156587f4d198b18857e553657cd6",
     ),
 }
 
@@ -408,18 +418,47 @@ def _build_llm(
         "enforce_eager": run_profile.enforce_eager,
         "limit_mm_per_prompt": {"image": 0, "video": 0},
     }
+    if model_profile.quantization is not None:
+        kwargs["quantization"] = model_profile.quantization
+    if model_profile.enable_expert_parallel:
+        kwargs["enable_expert_parallel"] = True
+    if model_profile.trust_remote_code:
+        kwargs["trust_remote_code"] = True
     if run_profile.uses_dflash:
         kwargs["speculative_config"] = {
             "method": "dflash",
             "model": model_profile.draft,
             "num_speculative_tokens": DFLASH_K,
         }
+        if model_profile.draft_tensor_parallel_size is not None:
+            kwargs["speculative_config"]["draft_tensor_parallel_size"] = (
+                model_profile.draft_tensor_parallel_size
+            )
     if run_profile.cudagraph_mode is not None:
         kwargs["compilation_config"] = CompilationConfig(
             cudagraph_mode=run_profile.cudagraph_mode,
             cudagraph_capture_sizes=GRAPH_CAPTURE_SIZES,
         )
     return LLM(**kwargs)
+
+
+def _model_runtime_configuration(
+    model_profile: ModelProfile,
+    run_profile: RunProfile,
+) -> dict[str, Any]:
+    """Return model runtime choices recorded in every validation result."""
+    return {
+        "tensor_parallel_size": model_profile.tensor_parallel_size,
+        "draft_tensor_parallel_size": (
+            model_profile.draft_tensor_parallel_size
+            if run_profile.uses_dflash
+            else None
+        ),
+        "dtype": model_profile.dtype,
+        "quantization": model_profile.quantization,
+        "enable_expert_parallel": model_profile.enable_expert_parallel,
+        "trust_remote_code": model_profile.trust_remote_code,
+    }
 
 
 def _build_workload(
@@ -554,6 +593,7 @@ def run_validation(
                 else None
             ),
             "num_speculative_tokens": DFLASH_K if run_profile.uses_dflash else 0,
+            **_model_runtime_configuration(model_profile, run_profile),
             "temperature": run_profile.temperature,
             "top_p": SAMPLING_TOP_P,
             "top_k": SAMPLING_TOP_K,
