@@ -1,15 +1,74 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import replace
 from math import lcm
 
 import vllm.model_executor.models.config
+import vllm.v1.core.kv_cache_utils
+from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    HiddenStateCacheSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    MambaSpec,
+)
+
+_ORIGINAL_GET_KV_CACHE_GROUPS = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+
+
+def _pad_dflash_mamba_page_sizes_310(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> dict[str, KVCacheSpec]:
+    """Pad DFlash Mamba pages without changing their logical block size."""
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or getattr(speculative_config, "method", None) != "dflash"
+        or not kv_cache_spec
+    ):
+        return kv_cache_spec
+
+    max_page_size = max(
+        (
+            spec.page_size_bytes
+            for spec in kv_cache_spec.values()
+            if isinstance(spec, FullAttentionSpec)
+            and not isinstance(spec, HiddenStateCacheSpec)
+        ),
+        default=None,
+    )
+    if max_page_size is None:
+        return kv_cache_spec
+    if not any(
+        isinstance(spec, MambaSpec) and spec.page_size_bytes < max_page_size
+        for spec in kv_cache_spec.values()
+    ):
+        return kv_cache_spec
+
+    return {
+        layer_name: replace(spec, page_size_padded=max_page_size)
+        if isinstance(spec, MambaSpec) and spec.page_size_bytes < max_page_size
+        else spec
+        for layer_name, spec in kv_cache_spec.items()
+    }
+
+
+def _get_kv_cache_groups_310(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    return _ORIGINAL_GET_KV_CACHE_GROUPS(
+        vllm_config,
+        _pad_dflash_mamba_page_sizes_310(vllm_config, kv_cache_spec),
+    )
 
 
 @classmethod
@@ -101,3 +160,4 @@ def verify_and_update_config(cls, vllm_config) -> None:
 
 
 vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = verify_and_update_config
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _get_kv_cache_groups_310
