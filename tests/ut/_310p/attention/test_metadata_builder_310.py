@@ -80,3 +80,47 @@ class TestAscendAttentionMetadataBuilder310Causal(TestBase):
             result = builder.build(0, common)
 
         torch.testing.assert_close(result.seq_lens_cpu, torch.tensor([4, 6], dtype=torch.int32))
+
+    def test_build_decode_binds_device_seq_lens_view(self):
+        builder = object.__new__(AscendAttentionMetadataBuilder310)
+        builder.device = torch.device("cpu")
+        builder._query_lens_cpu_buffer = torch.zeros(
+            8,
+            dtype=torch.int32,
+            device="cpu",
+        )
+
+        host_seq_lens = torch.tensor([4, 6, 99], dtype=torch.int32)
+        device_seq_lens = torch.tensor([4, 6, 99], dtype=torch.int32)
+        common = MagicMock()
+        common.num_reqs = 2
+        common._seq_lens_cpu = host_seq_lens
+        common.seq_lens_cpu = None
+        common.seq_lens = device_seq_lens
+        common.attn_state = AscendAttentionState.DecodeOnly
+
+        base_metadata = MagicMock()
+        base_metadata.attn_state = AscendAttentionState.DecodeOnly
+        base_metadata.seq_lens = host_seq_lens[:2]
+
+        with patch.object(
+            AscendAttentionMetadataBuilder310.__bases__[0],
+            "build",
+            return_value=base_metadata,
+        ):
+            result = builder.build(0, common)
+
+        self.assertEqual(
+            result.seq_lens.data_ptr(),
+            device_seq_lens.data_ptr(),
+        )
+        host_seq_lens[0] = 100
+        torch.testing.assert_close(
+            result.seq_lens,
+            torch.tensor([4, 6], dtype=torch.int32),
+        )
+        device_seq_lens[1] = 7
+        torch.testing.assert_close(
+            result.seq_lens,
+            torch.tensor([4, 7], dtype=torch.int32),
+        )

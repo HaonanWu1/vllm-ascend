@@ -128,6 +128,14 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         elif common_attn_metadata.seq_lens_cpu is not None:
             attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
 
+        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            # Decode attention consumes device metadata. Reuse the ordered
+            # device-side buffer instead of launching a per-layer H2D copy
+            # from the pinned host view, which async scheduling may overwrite
+            # for the following token before every layer has consumed it.
+            attn_metadata.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+            return attn_metadata
+
         splitfuse_states = (
             AscendAttentionState.SpecDecoding,
             AscendAttentionState.ChunkedPrefill,
