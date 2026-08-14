@@ -47,6 +47,7 @@ const size_t DIM_2 = 2;
 const size_t DIM_3 = 3;
 
 const size_t MAX_MTP = 8;
+const int64_t V_STEP_ALIGNMENT = 16; // 16 * sizeof(half) = 32B
 
 void RecurrentGatedDeltaRuleV310Tiling::InitCompileInfo()
 {
@@ -528,14 +529,14 @@ bool RecurrentGatedDeltaRuleV310Tiling::EvaluateBufferProfile(int64_t ubSize, in
                                                            BufferProfile &profile) const
 {
     int64_t coeff = CalcVStepCoeff(aDk, stateOutBufferNum, attnOutBufferNum);
-    int64_t vStep = (ubSize - usedUbBytes) / coeff / 8 * 8; // 8 * sizeof(float) = 32
-    if (vStep < 8) {
+    int64_t vStep = (ubSize - usedUbBytes) / coeff / V_STEP_ALIGNMENT * V_STEP_ALIGNMENT;
+    if (vStep < V_STEP_ALIGNMENT) {
         return false;
     }
     int64_t repeatTime = Ops::Transformer::CeilDiv(tilingData_.dv, static_cast<uint32_t>(vStep));
     vStep = Ops::Transformer::CeilAlign(Ops::Transformer::CeilDiv(tilingData_.dv, static_cast<uint32_t>(repeatTime)),
-                                 static_cast<uint32_t>(8));
-    if (vStep < 8) {
+                                 static_cast<uint32_t>(V_STEP_ALIGNMENT));
+    if (vStep < V_STEP_ALIGNMENT) {
         return false;
     }
     profile.stateOutBufferNum = stateOutBufferNum;
@@ -583,7 +584,7 @@ ge::graphStatus RecurrentGatedDeltaRuleV310Tiling::FinalizeVStepFromUb(int64_t u
         }
     }
     if (!selected.valid) {
-        OP_LOGE(context_->GetNodeName(), "vStep should be bigger than 8, shape is too big");
+        OP_LOGE(context_->GetNodeName(), "vStep should be at least 16, shape is too big");
         return ge::GRAPH_FAILED;
     }
 

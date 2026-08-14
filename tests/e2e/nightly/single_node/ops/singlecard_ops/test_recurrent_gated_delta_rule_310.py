@@ -259,6 +259,16 @@ def test_recurrent_multi_v_tile_state_prefetch():
 
 
 @pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+def test_recurrent_fp16_output_tile_alignment():
+    run_recurrent_case(
+        [1],
+        headdim_v=416,
+        with_g=False,
+        accepted_tokens=[1],
+    )
+
+
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
 def test_recurrent_repeated_state_writeback():
     run_recurrent_case(
         [8],
