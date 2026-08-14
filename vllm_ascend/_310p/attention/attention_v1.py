@@ -311,6 +311,13 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             qlens = qsl_cpu[1:] - qsl_cpu[:-1]
 
         block_table = attn_metadata.block_tables
+        layer_block_table = getattr(
+            self,
+            "_dflash_block_table_310",
+            None,
+        )
+        if layer_block_table is not None and not attn_metadata.causal:
+            block_table = layer_block_table
 
         if attn_metadata.seq_lens.device != query.device:
             attn_metadata.seq_lens = attn_metadata.seq_lens.to(

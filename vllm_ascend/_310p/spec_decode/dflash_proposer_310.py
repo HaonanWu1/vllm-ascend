@@ -112,6 +112,78 @@ def _get_dflash_slot_buffers_by_size_310(
     return context_buffers, query_buffers
 
 
+def _get_dflash_block_tables_by_size_310(
+    proposer: Any,
+    source_table: torch.Tensor,
+    block_sizes: list[int],
+) -> dict[int, torch.Tensor]:
+    """Materialize each draft cache layout from the runner's block table.
+
+    The runner expands a physical cache block using one kernel block size. A
+    layer whose allocated cache uses a smaller block needs proportionally more
+    block IDs; interpreting the runner table directly would enter its padding
+    columns before the physical block is exhausted.
+    """
+    try:
+        runner_table = proposer.runner.input_batch.block_table[
+            proposer.kv_cache_gid
+        ]
+        source_block_size = int(runner_table.block_size)
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            "310P DFlash cannot resolve the runner block-table layout."
+        ) from exc
+
+    buffers = getattr(
+        proposer,
+        "_dflash_block_table_buffers_by_size_310",
+        {},
+    )
+    tables: dict[int, torch.Tensor] = {}
+    source_rows, source_columns = source_table.shape
+    max_rows = max(
+        int(getattr(proposer, "max_batch_size", source_rows)),
+        source_rows,
+    )
+
+    for block_size in block_sizes:
+        if block_size == source_block_size:
+            tables[block_size] = source_table
+            continue
+
+        if source_block_size % block_size == 0:
+            ratio = source_block_size // block_size
+            target_columns = source_columns * ratio
+            buffer = buffers.get(block_size)
+            if buffer is None:
+                buffer = torch.empty(
+                    (max_rows, target_columns),
+                    dtype=source_table.dtype,
+                    device=source_table.device,
+                )
+                buffers[block_size] = buffer
+            if buffer.shape[0] < source_rows or buffer.shape[1] < target_columns:
+                raise RuntimeError(
+                    "310P DFlash block-table buffer is smaller than the active "
+                    "layout."
+                )
+            table = buffer[:source_rows, :target_columns]
+            table_view = table.view(source_rows, source_columns, ratio)
+            for offset in range(ratio):
+                table_view[:, :, offset].copy_(source_table)
+                table_view[:, :, offset].mul_(ratio).add_(offset)
+            tables[block_size] = table
+            continue
+
+        raise RuntimeError(
+            "310P DFlash layer block size must divide the runner block size: "
+            f"runner={source_block_size}, layer={block_size}."
+        )
+
+    proposer._dflash_block_table_buffers_by_size_310 = buffers
+    return tables
+
+
 def _ensure_kernel_block_size_matches_cache_310(proposer: Any) -> None:
     """Align the draft ``kernel_block_size`` with the allocated KV cache.
 
@@ -119,8 +191,8 @@ def _ensure_kernel_block_size_matches_cache_310(proposer: Any) -> None:
     (128), but on 310P the draft KV cache is allocated with a smaller kernel
     block size (e.g. 64, from splitting a 640-block spec). The mismatch makes the
     AscendC draft input builder compute slot mappings for a 128-block cache while
-    the real cache/block_table use 64, so the SplitFuse cross-attention reads
-    empty blocks and returns all-zero output (acceptance ~0).
+    some draft layers use 64-token blocks. The runner's 128-token block table is
+    converted separately for those layers by the draft input path.
     """
     if getattr(proposer, "_kernel_block_size_fixed_310", False):
         return
@@ -211,10 +283,10 @@ def _copy_and_expand_inputs_ascendc(
     # 310P: the draft KV cache is allocated by splitting the draft spec
     # block_size (e.g. 640) into smaller kernel blocks (e.g. 64), but the base
     # proposer set self.kernel_block_size to get_supported_kernel_block_sizes()[0]
-    # (128). Passing 128 here makes the AscendC builder compute draft slot
-    # mappings for a 128-block cache while the real cache/block_table use 64, so
-    # SplitFuse reads empty blocks and returns all-zero output. Align
-    # self.kernel_block_size with the allocated cache once, right before the op.
+    # (128). Passing 128 here makes the AscendC builder compute draft slots for
+    # 128-token blocks while the first allocated cache layer uses 64. Align the
+    # primary operation layout here; the per-layer tables and slots below retain
+    # the runner's 128-token layout for layers that actually use it.
     _ensure_kernel_block_size_matches_cache_310(self)
 
     if num_rejected_tokens_gpu is not None:
@@ -241,6 +313,11 @@ def _copy_and_expand_inputs_ascendc(
             self,
             block_sizes,
         )
+        block_tables = _get_dflash_block_tables_by_size_310(
+            self,
+            cad.block_table_tensor,
+            block_sizes,
+        )
     else:
         # DSpark continues to use its original single global layout and does
         # not acquire any DFlash-only persistent state.
@@ -249,6 +326,9 @@ def _copy_and_expand_inputs_ascendc(
         }
         query_buffers = {
             int(self.kernel_block_size): self._slot_mapping_buffer
+        }
+        block_tables = {
+            int(self.kernel_block_size): cad.block_table_tensor
         }
 
     out_token_indices = None
@@ -266,7 +346,7 @@ def _copy_and_expand_inputs_ascendc(
             cad.slot_mapping.to(torch.int32),
             cad.query_start_loc.to(torch.int32),
             cad.seq_lens.to(torch.int32),
-            cad.block_table_tensor.to(torch.int32),
+            block_tables[block_size].to(torch.int32),
             num_rejected,
             int(self.parallel_drafting_token_id),
             int(block_size),
@@ -299,6 +379,10 @@ def _copy_and_expand_inputs_ascendc(
         ]
         self._dflash_query_slot_mapping_by_layer_310 = [
             query_buffers[layer_block_sizes[layer_name]][:num_query_total]
+            for layer_name in self.attn_layer_names
+        ]
+        self._dflash_block_table_by_layer_310 = [
+            block_tables[layer_block_sizes[layer_name]]
             for layer_name in self.attn_layer_names
         ]
 
@@ -343,21 +427,31 @@ class AscendDflashProposer310(AscendDflashProposer):
             "_dflash_query_slot_mapping_by_layer_310",
             None,
         )
+        block_tables = getattr(
+            self,
+            "_dflash_block_table_by_layer_310",
+            None,
+        )
         if query_slot_mapping is not None:
             draft_model = getattr(self.model, "model", None)
             attention_layers = getattr(draft_model, "_attn_layers", None)
-            if attention_layers is None or len(attention_layers) != len(
-                query_slot_mapping
+            if (
+                attention_layers is None
+                or len(attention_layers) != len(query_slot_mapping)
+                or block_tables is None
+                or len(block_tables) != len(query_slot_mapping)
             ):
                 raise RuntimeError(
-                    "310P DFlash per-layer query slots do not match the "
+                    "310P DFlash per-layer cache layouts do not match the "
                     "allocated draft attention layers."
                 )
-            for attention, layer_slots in zip(
+            for attention, layer_slots, layer_table in zip(
                 attention_layers,
                 query_slot_mapping,
+                block_tables,
             ):
                 attention.impl._dflash_query_slot_mapping_310 = layer_slots
+                attention.impl._dflash_block_table_310 = layer_table
 
         self.model.precompute_and_store_context_kv(
             self._dflash_hidden_states[:num_context],

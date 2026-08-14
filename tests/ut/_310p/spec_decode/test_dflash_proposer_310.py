@@ -28,9 +28,20 @@ from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
 
 class TestCopyAndExpandInputsAscendC(TestBase):
     def _make_self(self, num_query_total, num_context):
+        block_table_layout = SimpleNamespace(
+            block_size=128,
+            physical_block_size=640,
+        )
         return SimpleNamespace(
             method="dflash",
             device=torch.device("cpu"),
+            max_batch_size=1,
+            kv_cache_gid=0,
+            runner=SimpleNamespace(
+                input_batch=SimpleNamespace(
+                    block_table=[block_table_layout],
+                ),
+            ),
             parallel_drafting_token_id=999,
             kernel_block_size=128,
             _kernel_block_size_fixed_310=True,
@@ -49,13 +60,22 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             slot_mapping=torch.zeros(num_context, dtype=torch.int32),
             query_start_loc=torch.tensor([0, num_context], dtype=torch.int32),
             seq_lens=torch.tensor([num_context], dtype=torch.int32),
-            block_table_tensor=torch.zeros(batch_size, 8, dtype=torch.int32),
+            block_table_tensor=captured.get(
+                "input_block_table",
+                torch.zeros(batch_size, 8, dtype=torch.int32),
+            ),
         )
 
         def fake_op(next_token_ids, tpos, *args, **kwargs):
             captured["tpos"] = tpos
             block_size = int(args[6])
             captured.setdefault("block_sizes", []).append(block_size)
+            captured.setdefault("block_table_objects_by_size", {})[
+                block_size
+            ] = args[3]
+            captured.setdefault("block_tables_by_size", {})[block_size] = (
+                args[3].clone()
+            )
             n = tpos.shape[0]
             context_slots_by_block = captured.get(
                 "op_context_slots_by_block", {}
@@ -249,6 +269,47 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             torch.full((4,), 1128, dtype=torch.int32),
         )
 
+    def test_64_layout_expands_the_128_kernel_block_table(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.kernel_block_size = 64
+        fake_self.attn_layer_names = ["layer.0", "layer.1"]
+        fake_self._dflash_layer_block_sizes_310 = {
+            "layer.0": 64,
+            "layer.1": 128,
+        }
+        source_table = torch.tensor(
+            [[15, 16, 17, 18, 19, 0, 0, 0]],
+            dtype=torch.int32,
+        )
+        captured = {"input_block_table": source_table}
+
+        self._run(
+            fake_self,
+            torch.arange(num_context, dtype=torch.int32),
+            num_context,
+            batch_size=1,
+            num_query_per_req=4,
+            captured=captured,
+        )
+
+        torch.testing.assert_close(
+            captured["block_tables_by_size"][64][0, :10],
+            torch.arange(30, 40, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            captured["block_tables_by_size"][128],
+            source_table,
+        )
+        self.assertIs(
+            fake_self._dflash_block_table_by_layer_310[0],
+            captured["block_table_objects_by_size"][64],
+        )
+        self.assertIs(
+            fake_self._dflash_block_table_by_layer_310[1],
+            source_table,
+        )
+
     def test_qwen_cache_shapes_are_discovered_and_bound_per_layer(self):
         num_context = 12
         layer_names = [
@@ -279,7 +340,12 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         fake_self.attn_layer_names = layer_names
         context_64 = torch.arange(64, 64 + num_context, dtype=torch.int32)
         context_128 = torch.arange(128, 128 + num_context, dtype=torch.int32)
+        source_table = torch.tensor(
+            [[15, 16, 17, 18, 19, 0, 0, 0]],
+            dtype=torch.int32,
+        )
         captured = {
+            "input_block_table": source_table,
             "op_context_slots_by_block": {
                 64: context_64,
                 128: context_128,
@@ -309,18 +375,27 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         query_by_layer = fake_self._dflash_query_slot_mapping_by_layer_310
         self.assertEqual(len(context_by_layer), 5)
         self.assertEqual(len(query_by_layer), 5)
+        block_table_by_layer = fake_self._dflash_block_table_by_layer_310
+        self.assertEqual(len(block_table_by_layer), 5)
+        expanded_table = captured["block_table_objects_by_size"][64]
         for layer_index in range(3):
             torch.testing.assert_close(context_by_layer[layer_index], context_64)
             torch.testing.assert_close(
                 query_by_layer[layer_index],
                 torch.full((4,), 1064, dtype=torch.int32),
             )
+            self.assertIs(block_table_by_layer[layer_index], expanded_table)
         for layer_index in range(3, 5):
             torch.testing.assert_close(context_by_layer[layer_index], context_128)
             torch.testing.assert_close(
                 query_by_layer[layer_index],
                 torch.full((4,), 1128, dtype=torch.int32),
             )
+            self.assertIs(block_table_by_layer[layer_index], source_table)
+        torch.testing.assert_close(
+            expanded_table[0, :10],
+            torch.arange(30, 40, dtype=torch.int32),
+        )
 
         attention_layers = [
             SimpleNamespace(impl=SimpleNamespace()) for _ in layer_names
@@ -341,6 +416,10 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             self.assertIs(
                 attention.impl._dflash_query_slot_mapping_310,
                 query_by_layer[layer_index],
+            )
+            self.assertIs(
+                attention.impl._dflash_block_table_310,
+                block_table_by_layer[layer_index],
             )
 
     def test_heterogeneous_slot_buffers_are_allocated_once(self):
@@ -371,6 +450,32 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         # needed for the secondary layout; replay must reuse both.
         self.assertEqual(empty_like.call_count, 2)
 
+    def test_heterogeneous_block_table_buffer_is_allocated_once(self):
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        fake_self.kernel_block_size = 64
+        fake_self.attn_layer_names = ["layer.0", "layer.1"]
+        fake_self._dflash_layer_block_sizes_310 = {
+            "layer.0": 64,
+            "layer.1": 128,
+        }
+
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310.torch.empty",
+            wraps=torch.empty,
+        ) as empty:
+            for _ in range(2):
+                self._run(
+                    fake_self,
+                    torch.arange(num_context, dtype=torch.int32),
+                    num_context,
+                    batch_size=1,
+                    num_query_per_req=4,
+                    captured={},
+                )
+
+        self.assertEqual(empty.call_count, 1)
+
     def test_dspark_does_not_create_dflash_layout_state(self):
         num_context = 12
         fake_self = self._make_self(num_query_total=4, num_context=num_context)
@@ -393,6 +498,9 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         self.assertFalse(
             hasattr(fake_self, "_dflash_query_slot_buffers_by_size_310")
         )
+        self.assertFalse(
+            hasattr(fake_self, "_dflash_block_table_buffers_by_size_310")
+        )
 
     def test_per_layer_slots_are_bound_to_context_and_query_writes(self):
         context_by_layer = [
@@ -402,6 +510,10 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         query_by_layer = [
             torch.tensor([66, 67, 68, 69], dtype=torch.int32),
             torch.tensor([130, 131, 132, 133], dtype=torch.int32),
+        ]
+        block_tables_by_layer = [
+            torch.tensor([[30, 31, 32, 33]], dtype=torch.int32),
+            torch.tensor([[15, 16]], dtype=torch.int32),
         ]
         attention_layers = [
             SimpleNamespace(impl=SimpleNamespace()),
@@ -416,6 +528,7 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             _context_slot_mapping_buffer=torch.tensor([1, 2], dtype=torch.int32),
             _dflash_context_slot_mapping_by_layer_310=context_by_layer,
             _dflash_query_slot_mapping_by_layer_310=query_by_layer,
+            _dflash_block_table_by_layer_310=block_tables_by_layer,
             input_ids=torch.tensor([5, 6, 7, 8], dtype=torch.int32),
             positions=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
             model=model,
@@ -436,6 +549,14 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         self.assertIs(
             attention_layers[1].impl._dflash_query_slot_mapping_310,
             query_by_layer[1],
+        )
+        self.assertIs(
+            attention_layers[0].impl._dflash_block_table_310,
+            block_tables_by_layer[0],
+        )
+        self.assertIs(
+            attention_layers[1].impl._dflash_block_table_310,
+            block_tables_by_layer[1],
         )
         self.assertEqual(
             result["input_ids"].data_ptr(),

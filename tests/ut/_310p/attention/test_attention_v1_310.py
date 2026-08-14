@@ -261,6 +261,57 @@ class TestAscendAttentionBackendImpl310(TestBase):
             mock_non_causal_mask.assert_called_once()
             mock_npu_paged_attention_splitfuse.assert_called_once()
 
+    @patch(
+        "torch_npu.npu_format_cast",
+        return_value=torch.randn((1, 128, 16, 16), dtype=torch.float16),
+    )
+    @patch("torch_npu._npu_reshape_and_cache")
+    @patch("torch_npu._npu_paged_attention_splitfuse")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_dflash_splitfuse_reads_layer_specific_block_table(
+        self,
+        mock_get_forward_context,
+        mock_npu_paged_attention_splitfuse,
+        mock_npu_reshape_and_cache,
+        mock_format_cast,
+    ):
+        query = torch.randn(5, 8, 64)
+        output = torch.empty_like(query)
+        original_table = torch.tensor([[15, 16, 17, 18, 19]])
+        layer_table = torch.arange(30, 40).view(1, 10)
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        metadata.causal = False
+        metadata.attn_mask = torch.randn(1, 128, 16, 16)
+        metadata.seq_lens = torch.tensor([5])
+        metadata.query_start_loc = torch.tensor([0, 5])
+        metadata.block_tables = original_table
+        metadata.num_actual_tokens = 5
+        metadata.slot_mapping = torch.zeros(5, dtype=torch.long)
+        self.impl._dflash_block_table_310 = layer_table
+
+        self.impl.support_compressed_mask = False
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        with patch(
+            "vllm_ascend._310p.attention.attention_v1."
+            "AttentionMaskBuilder310.get_non_causal_splitfuse_mask",
+            return_value=torch.zeros(1, 128, 16, 16),
+        ):
+            self.impl.forward_impl(
+                query,
+                None,
+                None,
+                None,
+                metadata,
+                output,
+            )
+
+        self.assertIs(
+            mock_npu_paged_attention_splitfuse.call_args.kwargs["block_table"],
+            layer_table,
+        )
+        self.assertIs(metadata.block_tables, original_table)
+
     def test_dflash_query_cache_write_uses_layer_specific_slots(self):
         query = torch.randn(4, 8, 128)
         key = torch.randn(4, 8, 128)
