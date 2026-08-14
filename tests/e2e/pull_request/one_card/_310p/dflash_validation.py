@@ -17,12 +17,14 @@ from pathlib import Path
 from typing import Any, Sequence
 
 DFLASH_K = 15
-AVERAGE_ACCEPTED_LENGTH_FORMULA = "1 + accepted_tokens / draft_rounds"
+AVERAGE_ACCEPTED_LENGTH_FORMULA = (
+    "mean(request_output_tokens / request_draft_rounds)"
+)
+GLOBAL_COUNTER_AVERAGE_ACCEPTED_LENGTH_FORMULA = (
+    "1 + accepted_tokens / draft_rounds"
+)
 COMPLETION_TOKENS_PER_DRAFT_ROUND_FORMULA = (
     "measured_output_tokens / draft_rounds"
-)
-MEAN_REQUEST_COMPLETION_TOKENS_PER_DRAFT_ROUND_FORMULA = (
-    "mean(request_output_tokens / request_draft_rounds)"
 )
 MAX_MODEL_LEN = 2048
 MAX_NUM_BATCHED_TOKENS = 2048
@@ -278,11 +280,11 @@ def summarize_run(
     *,
     request_counters: Sequence[WorkloadMetrics] | None = None,
 ) -> dict[str, Any]:
-    """Apply the single acceptance and performance formula used by all runs.
+    """Apply the pinned benchmark's acceptance and performance formulas.
 
-    One target token is produced per draft round even when no draft token is
-    accepted, so average accepted length is ``1 + accepted / draft_rounds``.
-    It is not applicable to target-only runs, which have no draft rounds.
+    The official gate gives every measured request equal weight. The two global
+    ratios remain diagnostics because weighting requests by their draft-round
+    count can change the benchmark result.
     """
     if min(asdict(counters).values()) < 0:
         raise ValueError("workload counters must be non-negative")
@@ -290,10 +292,10 @@ def summarize_run(
         raise ValueError("elapsed steady-state time must be positive")
 
     measured_output_tokens = sum(len(token_ids) for token_ids in output_token_ids)
-    average_accepted_length = None
+    global_counter_average_accepted_length = None
     completion_tokens_per_draft_round = None
     if counters.draft_rounds:
-        average_accepted_length = 1 + (
+        global_counter_average_accepted_length = 1 + (
             counters.accepted_tokens / counters.draft_rounds
         )
         completion_tokens_per_draft_round = (
@@ -301,11 +303,27 @@ def summarize_run(
         )
 
     request_metrics = None
-    mean_request_completion_tokens_per_draft_round = None
+    average_accepted_length = None
     if request_counters is not None:
         if len(request_counters) != len(output_token_ids):
             raise ValueError(
                 "request counter count must match measured output count"
+            )
+        request_counter_sums = WorkloadMetrics(
+            draft_rounds=sum(item.draft_rounds for item in request_counters),
+            drafted_tokens=sum(item.drafted_tokens for item in request_counters),
+            accepted_tokens=sum(item.accepted_tokens for item in request_counters),
+        )
+        if request_counter_sums != counters:
+            raise ValueError(
+                "request counters must sum to the workload counters"
+            )
+        if counters.draft_rounds and any(
+            item.draft_rounds == 0 for item in request_counters
+        ):
+            raise ValueError(
+                "every measured request in a speculative run must have draft "
+                "rounds"
             )
         request_metrics = []
         request_completion_values = []
@@ -313,13 +331,17 @@ def summarize_run(
             if min(asdict(request_counter).values()) < 0:
                 raise ValueError("request counters must be non-negative")
             request_average_accepted_length = None
+            counter_average_accepted_length = None
             request_completion_tokens_per_draft_round = None
             if request_counter.draft_rounds:
-                request_average_accepted_length = 1 + (
+                counter_average_accepted_length = 1 + (
                     request_counter.accepted_tokens / request_counter.draft_rounds
                 )
                 request_completion_tokens_per_draft_round = (
                     len(token_ids) / request_counter.draft_rounds
+                )
+                request_average_accepted_length = (
+                    request_completion_tokens_per_draft_round
                 )
                 request_completion_values.append(
                     request_completion_tokens_per_draft_round
@@ -329,13 +351,16 @@ def summarize_run(
                     **asdict(request_counter),
                     "output_tokens": len(token_ids),
                     "average_accepted_length": request_average_accepted_length,
+                    "counter_average_accepted_length": (
+                        counter_average_accepted_length
+                    ),
                     "completion_tokens_per_draft_round": (
                         request_completion_tokens_per_draft_round
                     ),
                 }
             )
         if request_completion_values:
-            mean_request_completion_tokens_per_draft_round = sum(
+            average_accepted_length = sum(
                 request_completion_values
             ) / len(request_completion_values)
 
@@ -343,17 +368,17 @@ def summarize_run(
         **asdict(counters),
         "average_accepted_length": average_accepted_length,
         "average_accepted_length_formula": AVERAGE_ACCEPTED_LENGTH_FORMULA,
+        "global_counter_average_accepted_length": (
+            global_counter_average_accepted_length
+        ),
+        "global_counter_average_accepted_length_formula": (
+            GLOBAL_COUNTER_AVERAGE_ACCEPTED_LENGTH_FORMULA
+        ),
         "completion_tokens_per_draft_round": (
             completion_tokens_per_draft_round
         ),
         "completion_tokens_per_draft_round_formula": (
             COMPLETION_TOKENS_PER_DRAFT_ROUND_FORMULA
-        ),
-        "mean_request_completion_tokens_per_draft_round": (
-            mean_request_completion_tokens_per_draft_round
-        ),
-        "mean_request_completion_tokens_per_draft_round_formula": (
-            MEAN_REQUEST_COMPLETION_TOKENS_PER_DRAFT_ROUND_FORMULA
         ),
         "request_metrics": request_metrics,
         "measured_output_tokens": measured_output_tokens,

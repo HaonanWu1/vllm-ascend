@@ -321,7 +321,7 @@ def test_collect_speculative_counters_uses_metric_deltas() -> None:
     )
 
 
-def test_summarize_run_defines_average_accepted_length() -> None:
+def test_summarize_run_requires_per_request_counters_for_official_mean() -> None:
     counters = WorkloadMetrics(
         draft_rounds=6,
         drafted_tokens=90,
@@ -334,12 +334,17 @@ def test_summarize_run_defines_average_accepted_length() -> None:
         elapsed_seconds=2.5,
     )
 
-    assert summary["average_accepted_length"] == pytest.approx(7.0)
+    assert summary["average_accepted_length"] is None
     assert summary["average_accepted_length_formula"] == (
+        "mean(request_output_tokens / request_draft_rounds)"
+    )
+    assert summary["global_counter_average_accepted_length"] == pytest.approx(
+        7.0
+    )
+    assert summary["global_counter_average_accepted_length_formula"] == (
         "1 + accepted_tokens / draft_rounds"
     )
     assert summary["completion_tokens_per_draft_round"] == pytest.approx(5 / 6)
-    assert summary["mean_request_completion_tokens_per_draft_round"] is None
     assert summary["measured_output_tokens"] == 5
     assert summary["elapsed_steady_state_seconds"] == 2.5
     assert summary["output_tokens_per_second"] == 2.0
@@ -359,18 +364,21 @@ def test_summarize_run_keeps_three_acceptance_aggregations_distinct() -> None:
         request_counters=request_counters,
     )
 
-    assert summary["average_accepted_length"] == pytest.approx(7.0)
-    assert summary["completion_tokens_per_draft_round"] == pytest.approx(20 / 6)
-    assert summary["mean_request_completion_tokens_per_draft_round"] == pytest.approx(
+    assert summary["average_accepted_length"] == pytest.approx(
         (12 / 2 + 8 / 4) / 2
     )
+    assert summary["global_counter_average_accepted_length"] == pytest.approx(
+        7.0
+    )
+    assert summary["completion_tokens_per_draft_round"] == pytest.approx(20 / 6)
     assert summary["request_metrics"] == [
         {
             "draft_rounds": 2,
             "drafted_tokens": 30,
             "accepted_tokens": 8,
             "output_tokens": 12,
-            "average_accepted_length": 5.0,
+            "average_accepted_length": 6.0,
+            "counter_average_accepted_length": 5.0,
             "completion_tokens_per_draft_round": 6.0,
         },
         {
@@ -378,10 +386,37 @@ def test_summarize_run_keeps_three_acceptance_aggregations_distinct() -> None:
             "drafted_tokens": 60,
             "accepted_tokens": 28,
             "output_tokens": 8,
-            "average_accepted_length": 8.0,
+            "average_accepted_length": 2.0,
+            "counter_average_accepted_length": 8.0,
             "completion_tokens_per_draft_round": 2.0,
         },
     ]
+
+
+def test_summarize_run_rejects_request_counters_that_do_not_sum_to_global() -> None:
+    with pytest.raises(ValueError, match="must sum to the workload counters"):
+        summarize_run(
+            WorkloadMetrics(6, 90, 36),
+            [list(range(12)), list(range(8))],
+            elapsed_seconds=2.0,
+            request_counters=[
+                WorkloadMetrics(2, 30, 8),
+                WorkloadMetrics(3, 45, 20),
+            ],
+        )
+
+
+def test_summarize_run_rejects_missing_speculative_request_rounds() -> None:
+    with pytest.raises(ValueError, match="every measured request"):
+        summarize_run(
+            WorkloadMetrics(2, 30, 8),
+            [list(range(12)), []],
+            elapsed_seconds=2.0,
+            request_counters=[
+                WorkloadMetrics(2, 30, 8),
+                WorkloadMetrics(0, 0, 0),
+            ],
+        )
 
 
 def test_summarize_target_only_marks_acceptance_not_applicable() -> None:
