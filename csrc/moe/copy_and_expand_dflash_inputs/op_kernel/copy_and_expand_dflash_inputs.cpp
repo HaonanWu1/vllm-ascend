@@ -8,8 +8,8 @@ using namespace AscendC;
 // ``copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid``.
 //
 // It builds the parallel-drafting draft inputs for DFlash / DSpark:
-//   1. Identity-copies the target/context positions and slot mapping
-//      (cross-attention context K/V metadata) straight through.
+//   1. Copies target/context positions and rebuilds their slot mapping from
+//      request boundaries and the physical draft-cache block layout.
 //   2. For every request builds the query block of
 //      ``num_query_per_req`` tokens: a bonus token followed by
 //      ``parallel_drafting_token_id`` mask tokens, with their positions
@@ -32,8 +32,8 @@ using namespace AscendC;
 //     array is flushed to GM once from offset 0 (32B aligned); the
 //     block-rounded tail lands in the destination tensor's own
 //     allocation padding.
-//   * The context identity copy is tiled on CTX_TILE (a multiple of 8),
-//     so every tile's GM offset stays 32B aligned.
+//   * Context positions and generated slots are tiled on CTX_TILE (a multiple
+//     of 8), so every tile's GM offset stays 32B aligned.
 class CopyAndExpandDflashInputsKernel {
 public:
     __aicore__ inline CopyAndExpandDflashInputsKernel() {}
@@ -80,8 +80,9 @@ public:
         pipe.InitBuffer(qSlotBuf, AlignUpBytes(numQueryTotal * sizeof(int32_t)));
         pipe.InitBuffer(tokBuf, AlignUpBytes(numTokenIndicesTotal * sizeof(int32_t)));
 
-        // Tile buffer for the bulk context identity copy.
-        pipe.InitBuffer(ctxBuf, AlignUpBytes(CTX_TILE * sizeof(int32_t)));
+        // Tile buffers for context positions and generated physical slots.
+        pipe.InitBuffer(ctxPosBuf, AlignUpBytes(CTX_TILE * sizeof(int32_t)));
+        pipe.InitBuffer(ctxSlotBuf, AlignUpBytes(CTX_TILE * sizeof(int32_t)));
     }
 
     __aicore__ inline void Process()
@@ -129,37 +130,64 @@ private:
         return (count + ELEMS_PER_BLK - 1) / ELEMS_PER_BLK * ELEMS_PER_BLK;
     }
 
-    // Identity copy of the whole context range for positions and slot
-    // mapping. A single ping-pong buffer is ordered with MTE2<->MTE3
-    // flags. Tile offsets are multiples of CTX_TILE, i.e. 32B aligned.
+    // Copy context positions and generate physical cache slots. Both buffers
+    // are ordered across MTE2, scalar, and MTE3 pipes. Tile offsets are
+    // multiples of CTX_TILE, i.e. 32B aligned.
     __aicore__ inline void CopyContext()
     {
         if (numContext == 0) return;
-        LocalTensor<int32_t> tile = ctxBuf.Get<int32_t>();
+        LocalTensor<int32_t> posTile = ctxPosBuf.Get<int32_t>();
+        LocalTensor<int32_t> slotTile = ctxSlotBuf.Get<int32_t>();
+        uint32_t req = 0;
+        int32_t ctxStart = numReqs > 0 ? gmQueryStartLoc.GetValue(0) : 0;
+        int32_t ctxEnd = numReqs > 0 ? gmQueryStartLoc.GetValue(1) : 0;
+
         // Prime "buffer free to write" so the first read (MTE2) proceeds.
         SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
         for (int32_t off = 0; off < (int32_t)numContext; off += CTX_TILE) {
             int32_t count = (int32_t)numContext - off;
             if (count > CTX_TILE) count = CTX_TILE;
-            CopyContextSegment(gmOutContextPositions, gmTargetPositions, tile, off, count);
-            CopyContextSegment(gmOutContextSlotMapping, gmContextSlotMapping, tile, off, count);
-        }
-        // Drain the trailing "buffer free" flag.
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
-    }
+            int32_t aligned = AlignUpElems(count);
 
-    __aicore__ inline void CopyContextSegment(GlobalTensor<int32_t>& dst,
-                                              GlobalTensor<int32_t>& src,
-                                              LocalTensor<int32_t>& tile,
-                                              int32_t off, int32_t count)
-    {
-        int32_t aligned = AlignUpElems(count);
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);  // buffer free to write
-        DataCopy(tile, src[off], aligned);          // GM -> UB (MTE2)
-        SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID4);
-        WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID4);  // data ready to read
-        DataCopy(dst[off], tile, aligned);          // UB -> GM (MTE3)
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);   // buffer free again
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
+            DataCopy(posTile, gmTargetPositions[off], aligned);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID4);
+            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID5);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID4);
+
+            for (int32_t j = 0; j < count; j++) {
+                int32_t contextIndex = off + j;
+                while (req < numReqs && contextIndex >= ctxEnd) {
+                    req++;
+                    if (req < numReqs) {
+                        ctxStart = gmQueryStartLoc.GetValue(req);
+                        ctxEnd = gmQueryStartLoc.GetValue(req + 1);
+                    }
+                }
+
+                int32_t slot = PADDING_SLOT_ID;
+                int32_t position = posTile.GetValue(j);
+                if (req < numReqs && contextIndex >= ctxStart && contextIndex < ctxEnd) {
+                    int32_t blockNum = position / (int32_t)blockSize;
+                    int32_t blockId = gmBlockTable.GetValue((int32_t)(req * blockTableStride) + blockNum);
+                    int64_t physicalSlot = (int64_t)blockId * (int64_t)blockSize +
+                                           (int64_t)(position % (int32_t)blockSize);
+                    slot = (int32_t)physicalSlot;
+                }
+                slotTile.SetValue(j, slot);
+            }
+            for (int32_t j = count; j < aligned; j++) {
+                slotTile.SetValue(j, PADDING_SLOT_ID);
+            }
+
+            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID5);
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID6);
+            WaitFlag<HardEvent::S_MTE3>(EVENT_ID6);
+            DataCopy(gmOutContextPositions[off], posTile, aligned);
+            DataCopy(gmOutContextSlotMapping[off], slotTile, aligned);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
+        }
+        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
     }
 
     __aicore__ inline void ProcessOneRequest(uint32_t r,
@@ -171,6 +199,7 @@ private:
         // Scalar metadata read directly from GM (proven 310P pattern).
         int32_t ctxStart = gmQueryStartLoc.GetValue(r);
         int32_t ctxEnd = gmQueryStartLoc.GetValue(r + 1);
+        bool paddedRequest = ctxEnd <= ctxStart;
 
         // Clamp numRejected to [0, ctxLen] so validCtxEnd stays inside this
         // request's own context span: a negative value or one exceeding the
@@ -178,7 +207,7 @@ private:
         // (data corruption) or produce validCtxEnd == 0 (see lastPos below).
         int32_t numRejected = gmNumRejectedTokens.GetValue(r);
         if (numRejected < 0) numRejected = 0;
-        int32_t ctxLen = ctxEnd - ctxStart;
+        int32_t ctxLen = paddedRequest ? 0 : ctxEnd - ctxStart;
         if (numRejected > ctxLen) numRejected = ctxLen;
         int32_t validCtxEnd = ctxEnd - numRejected;
 
@@ -188,7 +217,7 @@ private:
         int32_t nextTokenId = gmNextTokenIds.GetValue(r);
         // Guard the GM read: validCtxEnd == 0 (whole context rejected) would
         // otherwise read target_positions[-1] out of bounds.
-        int32_t lastPos = (validCtxEnd > 0) ? gmTargetPositions.GetValue(validCtxEnd - 1) : -1;
+        int32_t lastPos = (validCtxEnd > ctxStart) ? gmTargetPositions.GetValue(validCtxEnd - 1) : -1;
 
         int32_t queryBase = (int32_t)(r * numQueryPerReq);
 
@@ -197,9 +226,14 @@ private:
             lPos.SetValue(queryBase + q, queryPos);
 
             int32_t queryCachePos = effectiveSeqLen + q;
-            int32_t blockNum = queryCachePos / (int32_t)blockSize;
-            int64_t blockId = (int64_t)gmBlockTable.GetValue((int32_t)(r * blockTableStride) + blockNum);
-            int64_t slot = blockId * (int64_t)blockSize + (int64_t)(queryCachePos % (int32_t)blockSize);
+            int64_t slot = PADDING_SLOT_ID;
+            if (!paddedRequest) {
+                int32_t blockNum = queryCachePos / (int32_t)blockSize;
+                int64_t blockId =
+                    (int64_t)gmBlockTable.GetValue((int32_t)(r * blockTableStride) + blockNum);
+                slot = blockId * (int64_t)blockSize +
+                       (int64_t)(queryCachePos % (int32_t)blockSize);
+            }
             lSlot.SetValue(queryBase + q, (int32_t)slot);
 
             if (q == 0) {
@@ -223,6 +257,8 @@ private:
     }
 
 private:
+    static constexpr int32_t PADDING_SLOT_ID = -1;
+
     GlobalTensor<int32_t> gmNextTokenIds, gmTargetPositions, gmContextSlotMapping;
     GlobalTensor<int32_t> gmQueryStartLoc, gmSeqLens, gmBlockTable, gmNumRejectedTokens;
     GlobalTensor<int32_t> gmOutInputIds, gmOutQueryPositions, gmOutQuerySlotMapping;
@@ -234,7 +270,7 @@ private:
     uint32_t numQueryTotal, numTokenIndicesTotal;
 
     TPipe pipe;
-    TBuf<QuePosition::VECCALC> qIdsBuf, qPosBuf, qSlotBuf, tokBuf, ctxBuf;
+    TBuf<QuePosition::VECCALC> qIdsBuf, qPosBuf, qSlotBuf, tokBuf, ctxPosBuf, ctxSlotBuf;
 };
 
 extern "C" __global__ __aicore__ void copy_and_expand_dflash_inputs(

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch.overrides import TorchFunctionMode
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.spec_decode.dflash_proposer_310 import _copy_and_expand_inputs_ascendc
@@ -28,6 +29,7 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             device=torch.device("cpu"),
             parallel_drafting_token_id=999,
             kernel_block_size=128,
+            _kernel_block_size_fixed_310=True,
             num_speculative_tokens=3,
             input_ids=torch.zeros(num_query_total, dtype=torch.int32),
             positions=torch.zeros(num_query_total, dtype=torch.int32),
@@ -49,12 +51,15 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         def fake_op(next_token_ids, tpos, *args, **kwargs):
             captured["tpos"] = tpos
             n = tpos.shape[0]
+            context_slots = captured.get(
+                "op_context_slots", torch.zeros(n, dtype=torch.int32)
+            ).clone()
             return (
                 torch.zeros(num_query_total, dtype=torch.int32),
                 torch.zeros(num_query_total, dtype=torch.int32),
                 torch.zeros(num_query_total, dtype=torch.int32),
                 torch.arange(n, dtype=torch.int32),
-                torch.zeros(n, dtype=torch.int32),
+                context_slots,
                 torch.zeros(batch_size * 3, dtype=torch.int32),
             )
 
@@ -108,3 +113,39 @@ class TestCopyAndExpandInputsAscendC(TestBase):
 
         self.assertEqual(captured["tpos"].dim(), 1)
         self.assertEqual(captured["tpos"].shape[0], num_context)
+
+    def test_custom_op_context_slots_are_authoritative(self):
+        num_context = 12
+        target_positions = torch.arange(num_context, dtype=torch.int32)
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        expected_slots = torch.arange(500, 500 + num_context, dtype=torch.int32)
+        captured = {"op_context_slots": expected_slots}
+
+        self._run(fake_self, target_positions, num_context, batch_size=1, num_query_per_req=4, captured=captured)
+
+        torch.testing.assert_close(fake_self._context_slot_mapping_buffer, expected_slots)
+
+    def test_copy_path_does_not_subtract_query_start_locations(self):
+        class OpRecorder(TorchFunctionMode):
+            def __init__(self):
+                self.operations = []
+
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                self.operations.append(func.__name__)
+                return func(*args, **(kwargs or {}))
+
+        num_context = 12
+        fake_self = self._make_self(num_query_total=4, num_context=num_context)
+        recorder = OpRecorder()
+
+        with recorder:
+            self._run(
+                fake_self,
+                torch.arange(num_context, dtype=torch.int32),
+                num_context,
+                batch_size=1,
+                num_query_per_req=4,
+                captured={},
+            )
+
+        self.assertNotIn("sub", recorder.operations)

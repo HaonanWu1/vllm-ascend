@@ -74,43 +74,6 @@ def _draft_cache_block_size_310(proposer: Any) -> int | None:
     return int(cache.shape[-2])
 
 
-def _recompute_context_slots_310(
-    out_context_slot_mapping: torch.Tensor,
-    context_positions: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    block_table: torch.Tensor,
-    kbs: int,
-    num_context: int,
-    num_reqs: int,
-) -> None:
-    """Rebuild the context KV-cache slots with block_table + kernel_block_size.
-
-    The AscendC op recomputes QUERY slots from ``block_table[pos // kbs] * kbs +
-    pos % kbs`` (kbs = corrected 64), but CONTEXT slots are an identity
-    passthrough of ``cad.slot_mapping`` which the model runner built for a
-    128-block layout. In the allocated 64-block draft cache those context slots
-    (e.g. 15*128=1920) point at an unreachable physical block (30) that is not in
-    the request's block_table, so the draft cross-attention never sees the
-    context K/V. Recompute context slots with the SAME scheme as the query slots
-    so context and query land in the same physical blocks.
-    """
-    if num_context <= 0 or kbs <= 0:
-        return
-    dev = out_context_slot_mapping.device
-    qsl = query_start_loc[: num_reqs + 1].to(device=dev, dtype=torch.long)
-    counts = (qsl[1:] - qsl[:-1]).clamp(min=0)
-    if int(counts.sum().item()) < num_context:
-        return
-    req_ids = torch.repeat_interleave(
-        torch.arange(num_reqs, device=dev), counts
-    )[:num_context]
-    cpos = context_positions[:num_context].to(device=dev, dtype=torch.long)
-    block_num = cpos // kbs
-    blk = block_table[req_ids, block_num].to(torch.long)
-    slot = (blk * kbs + (cpos % kbs)).to(out_context_slot_mapping.dtype)
-    out_context_slot_mapping[:num_context].copy_(slot)
-
-
 def _ensure_kernel_block_size_matches_cache_310(proposer: Any) -> None:
     """Align the draft ``kernel_block_size`` with the allocated KV cache.
 
@@ -244,20 +207,6 @@ def _copy_and_expand_inputs_ascendc(
     )
 
     num_query_total = batch_size * num_query_per_req
-
-    # The op passes context slots through from cad.slot_mapping (128-block
-    # layout) while query slots are recomputed for the 64-block cache. Rebuild
-    # context slots with the same block_table + kernel_block_size so context K/V
-    # is written where the draft cross-attention actually reads it.
-    _recompute_context_slots_310(
-        out_context_slot_mapping,
-        out_context_positions,
-        cad.query_start_loc,
-        cad.block_table_tensor,
-        int(self.kernel_block_size),
-        num_context,
-        batch_size,
-    )
 
     self.input_ids[:num_query_total].copy_(out_input_ids[:num_query_total])
     self.positions[:num_query_total].copy_(out_query_positions[:num_query_total])

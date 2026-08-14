@@ -55,19 +55,22 @@ def golden_copy_and_expand_dflash(
         ctx_start = int(query_start_loc[req])
         ctx_end = int(query_start_loc[req + 1])
 
-        # 1. Context identity copy.
+        # 1. Context positions are copied, while slots are rebuilt for the
+        # physical draft-cache block layout used by the query slots.
         for j in range(ctx_start, ctx_end):
             out_context_positions[j] = target_positions[j]
-            out_context_slot_mapping[j] = context_slot_mapping[j]
+            position = int(target_positions[j])
+            block_num = position // block_size
+            block_id = int(block_table[req, block_num])
+            out_context_slot_mapping[j] = block_id * block_size + (position % block_size)
 
         num_rejected = int(num_rejected_tokens[req])
-        if num_rejected < 0:
-            num_rejected = 0
+        num_rejected = min(max(num_rejected, 0), ctx_end - ctx_start)
         valid_ctx_end = ctx_end - num_rejected
 
         seq_len = int(seq_lens[req])
-        effective_seq_len = seq_len - num_rejected
-        last_pos = int(target_positions[valid_ctx_end - 1])
+        effective_seq_len = max(seq_len - num_rejected, 0)
+        last_pos = int(target_positions[valid_ctx_end - 1]) if valid_ctx_end > ctx_start else -1
 
         # 2. Query block.
         for q in range(num_query_per_req):
@@ -76,9 +79,12 @@ def golden_copy_and_expand_dflash(
             out_query_positions[query_out_idx] = query_pos
 
             query_cache_pos = effective_seq_len + q
-            block_num = query_cache_pos // block_size
-            block_id = int(block_table[req, block_num])
-            slot = block_id * block_size + (query_cache_pos % block_size)
+            if ctx_end <= ctx_start:
+                slot = -1
+            else:
+                block_num = query_cache_pos // block_size
+                block_id = int(block_table[req, block_num])
+                slot = block_id * block_size + (query_cache_pos % block_size)
             out_query_slot_mapping[query_out_idx] = slot
 
             if q == 0:
@@ -204,6 +210,78 @@ def _assert_all_close(npu_out, golden_out):
     ]
     for name, n, g in zip(names, npu_out, golden_out):
         torch.testing.assert_close(n, torch.from_numpy(g), atol=0, rtol=0, msg=f"{name} mismatch")
+
+
+def _uneven_context_slot_case():
+    return {
+        "next_token_ids": np.array([5, 7], dtype=np.int32),
+        "target_positions": np.array([63, 64, 129, 0, 127, 128, 191], dtype=np.int32),
+        # Deliberately unrelated to the physical 64-token draft-cache layout.
+        "context_slot_mapping": np.arange(900, 907, dtype=np.int32),
+        "query_start_loc": np.array([0, 3, 7], dtype=np.int32),
+        "seq_lens": np.array([130, 192], dtype=np.int32),
+        "block_table": np.array(
+            [[10, 11, 12, 13], [20, 21, 22, 23]],
+            dtype=np.int32,
+        ),
+        "num_rejected_tokens": np.array([1, 2], dtype=np.int32),
+        "parallel_drafting_token_id": 100,
+        "block_size": 64,
+        "num_query_per_req": 4,
+        "num_speculative_tokens": 3,
+        "sample_from_anchor": False,
+    }
+
+
+def _padded_request_case():
+    return {
+        "next_token_ids": np.array([5, 0], dtype=np.int32),
+        "target_positions": np.array([63, 64, 129], dtype=np.int32),
+        "context_slot_mapping": np.arange(900, 903, dtype=np.int32),
+        "query_start_loc": np.array([0, 3, 3], dtype=np.int32),
+        "seq_lens": np.array([130, 0], dtype=np.int32),
+        "block_table": np.array([[10, 11, 12, 13], [0, 0, 0, 0]], dtype=np.int32),
+        "num_rejected_tokens": np.array([1, 0], dtype=np.int32),
+        "parallel_drafting_token_id": 100,
+        "block_size": 64,
+        "num_query_per_req": 4,
+        "num_speculative_tokens": 3,
+        "sample_from_anchor": False,
+    }
+
+
+def test_cpu_reference_maps_uneven_context_across_blocks():
+    case = _uneven_context_slot_case()
+    outputs = golden_copy_and_expand_dflash(**case)
+
+    assert outputs[1].tolist() == [65, 66, 67, 68, 128, 129, 130, 131]
+    assert outputs[2].tolist() == [769, 770, 771, 772, 1470, 1471, 1472, 1473]
+    assert outputs[3].tolist() == [63, 64, 129, 0, 127, 128, 191]
+    assert outputs[4].tolist() == [703, 704, 769, 1280, 1407, 1408, 1471]
+    assert outputs[5].tolist() == [1, 2, 3, 5, 6, 7]
+
+
+def test_cpu_reference_marks_empty_padded_request_inert():
+    outputs = golden_copy_and_expand_dflash(**_padded_request_case())
+
+    assert outputs[1].tolist() == [65, 66, 67, 68, 0, 1, 2, 3]
+    assert outputs[2].tolist() == [769, 770, 771, 772, -1, -1, -1, -1]
+
+
+def test_context_slots_use_allocated_block_layout():
+    case = _uneven_context_slot_case()
+    golden = golden_copy_and_expand_dflash(**case)
+
+    _assert_all_close(npu_op_exec(case), golden)
+
+
+def test_empty_padded_request_has_inert_query_slots():
+    case = _padded_request_case()
+    golden = golden_copy_and_expand_dflash(**case)
+    npu_out = npu_op_exec(case)
+
+    torch.testing.assert_close(npu_out[1], torch.from_numpy(golden[1]), atol=0, rtol=0)
+    torch.testing.assert_close(npu_out[2], torch.from_numpy(golden[2]), atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
