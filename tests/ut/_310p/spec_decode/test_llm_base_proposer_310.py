@@ -46,6 +46,9 @@ class TestAscendSpecDecodeBaseProposer310(TestBase):
             patch("vllm_ascend._310p.spec_decode.llm_base_proposer_310._original_run_merged_draft", mock_original),
         ):
             proposer = object.__new__(AscendSpecDecodeBaseProposer310)
+            # object.__new__ bypasses the base proposer initializer, which
+            # always supplies this discriminator in production.
+            proposer.method = "mtp"
             proposer._run_merged_draft(
                 num_input_tokens=4,
                 batch_size=2,
