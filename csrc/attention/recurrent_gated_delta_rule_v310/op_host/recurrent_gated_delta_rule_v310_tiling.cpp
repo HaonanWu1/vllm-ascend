@@ -46,7 +46,7 @@ const size_t DIM_1 = 1;
 const size_t DIM_2 = 2;
 const size_t DIM_3 = 3;
 
-const size_t MAX_MTP = 8;
+const size_t MAX_MTP = 16;
 const int64_t V_STEP_ALIGNMENT = 16; // 16 * sizeof(half) = 32B
 
 void RecurrentGatedDeltaRuleV310Tiling::InitCompileInfo()
