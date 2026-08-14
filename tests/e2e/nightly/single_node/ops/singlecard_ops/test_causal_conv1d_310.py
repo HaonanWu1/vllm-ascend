@@ -3,6 +3,7 @@ import torch
 import torch_npu
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend._310p.ops.causal_conv1d import causal_conv1d_ref
 from vllm_ascend._310p.ops.causal_conv1d import causal_conv1d_fn as causal_conv1d_fn_ref
 from vllm_ascend._310p.ops.causal_conv1d import causal_conv1d_update as causal_conv1d_update_ref
 from vllm_ascend.utils import enable_custom_op
@@ -89,6 +90,62 @@ def test_ascend_causal_conv1d_310_fn(
     ).transpose(-1, -2)
     validate_cmp(out, out_ref)
     validate_cmp(conv_states, conv_states_ref)
+
+
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_causal_conv1d_310_k15_repeated_state(has_bias):
+    torch.random.manual_seed(20260814)
+    enable_custom_op()
+    device = "npu"
+    seq_len = 16
+    dim = 4096
+    width = 4
+    state_len = (width - 1) + (seq_len - 1)
+    accepted_tokens = 15
+
+    weight = torch.randn(dim, width, device=device, dtype=torch.float16)
+    bias = torch.randn(dim, device=device, dtype=torch.float16) if has_bias else None
+    conv_states = torch.randn((1, state_len, dim), device=device, dtype=torch.float16).transpose(-1, -2)
+    conv_states_ref = conv_states.clone()
+    query_start_loc = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
+    cache_indices = torch.tensor([0], device=device, dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([accepted_tokens], device=device, dtype=torch.int32)
+
+    for _ in range(2):
+        x = torch.randn((1, dim, seq_len), device=device, dtype=torch.float16)
+        initial_states = conv_states_ref[:, :, accepted_tokens - 1 : accepted_tokens + width - 2].clone()
+        out_ref, _ = causal_conv1d_ref(
+            x,
+            weight,
+            bias=bias,
+            initial_states=initial_states,
+            return_final_states=False,
+            activation="silu",
+        )
+
+        previous_states = conv_states_ref.clone()
+        conv_states_ref[:, :, : width - 2].copy_(
+            previous_states[:, :, accepted_tokens : accepted_tokens + width - 2]
+        )
+        conv_states_ref[:, :, width - 2 :].copy_(x)
+
+        out = torch.ops._C_ascend.npu_causal_conv1d_310(
+            x.transpose(-1, -2),
+            weight.transpose(-1, -2),
+            bias=bias,
+            conv_states=conv_states.transpose(-1, -2),
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            initial_state_mode=None,
+            num_accepted_tokens=num_accepted_tokens,
+            activation_mode=1,
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=1,
+        ).transpose(-1, -2)
+
+        validate_cmp(out, out_ref)
+        validate_cmp(conv_states, conv_states_ref)
 
 
 @pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
