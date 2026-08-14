@@ -96,6 +96,111 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
+    def test_dflash_shared_attention_cache_uses_per_layer_physical_views(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner.speculative_config = SimpleNamespace(method="dflash")
+        runner.runner_only_attn_layers = set()
+        runner.device = torch.device("cpu")
+        runner._acl_format = 29
+        runner.attn_backend = SimpleNamespace(
+            get_supported_kernel_block_sizes=lambda: [128, 64],
+            get_kv_cache_shape=lambda num_blocks, block_size, num_kv_heads, head_size: (
+                2,
+                num_blocks,
+                (num_kv_heads * head_size) // 16,
+                block_size,
+                16,
+            ),
+        )
+        target_spec = AttentionSpec(
+            block_size=2560,
+            num_kv_heads=1,
+            head_size=256,
+            dtype=torch.float16,
+        )
+        draft_spec = AttentionSpec(
+            block_size=1280,
+            num_kv_heads=4,
+            head_size=128,
+            dtype=torch.float16,
+        )
+        self.assertEqual(target_spec.page_size_bytes, draft_spec.page_size_bytes)
+        num_blocks = 2
+        config = SimpleNamespace(
+            num_blocks=num_blocks,
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["target.attn"],
+                    kv_cache_spec=target_spec,
+                ),
+                SimpleNamespace(
+                    layer_names=["draft.attn"],
+                    kv_cache_spec=draft_spec,
+                ),
+            ],
+            kv_cache_tensors=[
+                SimpleNamespace(
+                    size=target_spec.page_size_bytes * num_blocks,
+                    shared_by=["target.attn", "draft.attn"],
+                )
+            ],
+        )
+
+        def allocate():
+            with patch(
+                "vllm_ascend._310p.model_runner_310p.torch_npu.empty_with_format",
+                side_effect=lambda size, dtype, device, acl_format: torch.empty(
+                    size,
+                    dtype=dtype,
+                ),
+            ):
+                return runner._allocate_kv_cache_tensors(config)
+
+        caches = allocate()
+
+        target_k, target_v = caches["target.attn"]
+        draft_k, draft_v = caches["draft.attn"]
+        self.assertEqual(target_k.shape, (80, 16, 64, 16))
+        self.assertEqual(draft_k.shape, (20, 32, 128, 16))
+        self.assertEqual(target_k.data_ptr(), draft_k.data_ptr())
+        self.assertEqual(target_v.data_ptr(), draft_v.data_ptr())
+        self.assertIsNot(target_k, draft_k)
+        self.assertIsNot(target_v, draft_v)
+
+        runner.speculative_config = SimpleNamespace(method="dspark")
+        non_dflash_caches = allocate()
+        self.assertIs(
+            non_dflash_caches["target.attn"][0],
+            non_dflash_caches["draft.attn"][0],
+        )
+
+        runner.speculative_config = SimpleNamespace(method="dflash")
+        config.kv_cache_groups[1].kv_cache_spec = target_spec
+        uniform_caches = allocate()
+        self.assertIs(
+            uniform_caches["target.attn"][0],
+            uniform_caches["draft.attn"][0],
+        )
+
+        config.kv_cache_groups[1].kv_cache_spec = AttentionSpec(
+            block_size=1280,
+            num_kv_heads=4,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        with self.assertRaisesRegex(RuntimeError, "must use one dtype"):
+            allocate()
+
+        config.kv_cache_groups[1].kv_cache_spec = AttentionSpec(
+            block_size=640,
+            num_kv_heads=4,
+            head_size=128,
+            dtype=torch.float16,
+            page_size_padded=target_spec.page_size_bytes,
+        )
+        with self.assertRaisesRegex(RuntimeError, "equal storage sizes"):
+            allocate()
+
     def test_dflash_attention_metadata_captures_state_indices(self):
         runner = object.__new__(NPUModelRunner310)
         runner.speculative_config = SimpleNamespace(method="dflash")

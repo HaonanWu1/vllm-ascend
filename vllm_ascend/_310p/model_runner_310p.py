@@ -67,6 +67,33 @@ _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
 
 
+def _get_attention_cache_shape_310(
+    attention_backend: Any,
+    cache_spec: AttentionSpec,
+    num_blocks: int,
+) -> tuple[int, ...]:
+    supported_sizes = [
+        support_size
+        for support_size in attention_backend.get_supported_kernel_block_sizes()
+        if support_size * cache_spec.head_size <= _ATTENTION_BLOCK_SIZE_LIMIT
+    ]
+    if supported_sizes:
+        block_size = supported_sizes[0]
+        block_size_chunk = cache_spec.block_size // block_size
+        return attention_backend.get_kv_cache_shape(
+            num_blocks * block_size_chunk,
+            block_size,
+            cache_spec.num_kv_heads,
+            cache_spec.head_size,
+        )
+    return attention_backend.get_kv_cache_shape(
+        num_blocks,
+        cache_spec.block_size,
+        cache_spec.num_kv_heads,
+        cache_spec.head_size,
+    )
+
+
 def _build_state_metadata_diagnostic(result) -> dict | None:
     per_layer_metadata = result[0]
     if not isinstance(per_layer_metadata, dict):
@@ -819,6 +846,10 @@ class NPUModelRunner310(NPUModelRunner):
         """
         # init kv cache tensors
         kv_cache: dict[str, list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]] = {}
+        speculative_config = getattr(self, "speculative_config", None)
+        use_dflash_cache_views = (
+            getattr(speculative_config, "method", None) == "dflash"
+        )
         # get kv cache spec for each layer
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
         for group_kv_cache_spec in kv_cache_config.kv_cache_groups:
@@ -855,25 +886,11 @@ class NPUModelRunner310(NPUModelRunner):
                     assert kv_cache_tensor.size % kv_cache_spec.page_size_bytes == 0
                     num_blocks = kv_cache_tensor.size // kv_cache_spec.page_size_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
-                    # Page attention operation on 310P limits block_size * head_size <= 128 * 128
-                    supported_sizes = [
-                        support_size
-                        for support_size in self.attn_backend.get_supported_kernel_block_sizes()
-                        if support_size * kv_cache_spec.head_size <= _ATTENTION_BLOCK_SIZE_LIMIT
-                    ]
-                    if supported_sizes:
-                        block_size = supported_sizes[0]
-                        block_size_chunk = kv_cache_spec.block_size // block_size
-                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                            num_blocks * block_size_chunk,
-                            block_size,
-                            kv_cache_spec.num_kv_heads,
-                            kv_cache_spec.head_size,
-                        )
-                    else:
-                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                            num_blocks, kv_cache_spec.block_size, kv_cache_spec.num_kv_heads, kv_cache_spec.head_size
-                        )
+                    kv_cache_shape = _get_attention_cache_shape_310(
+                        self.attn_backend,
+                        kv_cache_spec,
+                        num_blocks,
+                    )
                     k_shape = kv_cache_shape[1:]
                     v_shape = k_shape
                     dtype = kv_cache_spec.dtype
@@ -886,7 +903,36 @@ class NPUModelRunner310(NPUModelRunner):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            kv_cache[layer_name_inner] = (k_cache, v_cache)
+                            layer_cache = (k_cache, v_cache)
+                            if use_dflash_cache_views:
+                                inner_spec = layer_kv_cache_spec[layer_name_inner]
+                                assert isinstance(inner_spec, AttentionSpec)
+                                if inner_spec.dtype != dtype:
+                                    raise RuntimeError(
+                                        "310P DFlash shared attention caches must "
+                                        "use one dtype."
+                                    )
+                                assert kv_cache_tensor.size % inner_spec.page_size_bytes == 0
+                                inner_num_blocks = (
+                                    kv_cache_tensor.size
+                                    // inner_spec.page_size_bytes
+                                )
+                                inner_shape = _get_attention_cache_shape_310(
+                                    self.attn_backend,
+                                    inner_spec,
+                                    inner_num_blocks,
+                                )[1:]
+                                if math.prod(inner_shape) != k_cache.numel():
+                                    raise RuntimeError(
+                                        "310P DFlash shared attention cache views "
+                                        "must have equal storage sizes."
+                                    )
+                                if tuple(k_cache.shape) != tuple(inner_shape):
+                                    layer_cache = (
+                                        k_cache.view(inner_shape),
+                                        v_cache.view(inner_shape),
+                                    )
+                            kv_cache[layer_name_inner] = layer_cache
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
