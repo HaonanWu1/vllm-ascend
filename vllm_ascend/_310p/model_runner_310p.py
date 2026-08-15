@@ -213,11 +213,17 @@ class NPUModelRunner310(NPUModelRunner):
             "_dflash_requested_cudagraph_mode_310",
             CUDAGraphMode.NONE,
         )
+        effective_cudagraph_mode = getattr(
+            self,
+            "_dflash_effective_cudagraph_mode_310",
+            requested_cudagraph_mode,
+        )
         dflash_piecewise = (
             self.speculative_config is not None
             and self.speculative_config.method == "dflash"
-            and requested_cudagraph_mode == self.cudagraph_dispatcher.cudagraph_mode
-            and requested_cudagraph_mode in (
+            and effective_cudagraph_mode
+            == self.cudagraph_dispatcher.cudagraph_mode
+            and effective_cudagraph_mode in (
                 CUDAGraphMode.PIECEWISE,
                 CUDAGraphMode.FULL_AND_PIECEWISE,
             )
@@ -828,7 +834,20 @@ class NPUModelRunner310(NPUModelRunner):
             and self.speculative_config.method == "dflash"
         )
         capture_graph_modes = is_dflash and dflash_diagnostic_enabled()
-        requested_mode = self.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
+        configured_mode = (
+            self.compilation_config.cudagraph_mode
+            or CUDAGraphMode.NONE
+        )
+        fallback_requested_mode = getattr(
+            self.compilation_config,
+            "_dflash_requested_cudagraph_mode_310",
+            None,
+        )
+        requested_mode = (
+            fallback_requested_mode
+            if fallback_requested_mode is not None
+            else configured_mode
+        )
         if is_dflash and not hasattr(
             self,
             "_dflash_requested_cudagraph_mode_310",
@@ -836,6 +855,19 @@ class NPUModelRunner310(NPUModelRunner):
             self._dflash_requested_cudagraph_mode_310 = requested_mode
         with self.temporary_modify_uniform_decode_query_len():
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
+        if is_dflash:
+            is_full_atb_fallback = (
+                fallback_requested_mode == CUDAGraphMode.FULL
+                and configured_mode
+                == CUDAGraphMode.FULL_AND_PIECEWISE
+                and self.cudagraph_dispatcher.cudagraph_mode
+                == CUDAGraphMode.FULL_AND_PIECEWISE
+            )
+            self._dflash_effective_cudagraph_mode_310 = (
+                CUDAGraphMode.FULL_AND_PIECEWISE
+                if is_full_atb_fallback
+                else requested_mode
+            )
         if capture_graph_modes:
             remember_dflash_graph_modes(
                 self.vllm_config,

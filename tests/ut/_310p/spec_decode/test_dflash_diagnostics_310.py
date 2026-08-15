@@ -212,6 +212,37 @@ def test_graph_mode_refresh_preserves_the_original_request(tmp_path: Path):
     assert record["normalized_mode"] == "FULL_DECODE_ONLY"
 
 
+def test_graph_mode_marker_preserves_request_for_draft_config(
+    tmp_path: Path,
+):
+    output = tmp_path / "draft-fallback.jsonl"
+    config = _dflash_graph_config()
+    config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    config.compilation_config._dflash_requested_cudagraph_mode_310 = (
+        CUDAGraphMode.FULL
+    )
+
+    with patch.dict(
+        os.environ,
+        {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
+        clear=False,
+    ):
+        _reset_dflash_diagnostics_for_test()
+        capture_dflash_graph_dispatch(
+            config,
+            path="draft",
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=_graph_descriptor(),
+        )
+    _reset_dflash_diagnostics_for_test()
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["requested_mode"] == "FULL"
+    assert record["normalized_mode"] == "FULL_AND_PIECEWISE"
+
+
 @pytest.mark.parametrize("path", ["target", "draft"])
 @pytest.mark.parametrize("action", ["capture", "replay"])
 def test_acl_graph_observer_records_path_and_actual_occurrence(

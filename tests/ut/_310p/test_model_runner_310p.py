@@ -844,6 +844,163 @@ def test_dflash_graph_mode_normalization_is_remembered(
         remember.assert_not_called()
 
 
+def test_dflash_early_fallback_mode_is_remembered() -> None:
+    compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        _dflash_requested_cudagraph_mode_310=CUDAGraphMode.FULL,
+    )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash"),
+        compilation_config=compilation_config,
+    )
+    runner = object.__new__(NPUModelRunner310)
+    runner.vllm_config = config
+    runner.speculative_config = config.speculative_config
+    runner.compilation_config = compilation_config
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+
+    with (
+        patch(
+            "vllm_ascend._310p.model_runner_310p.NPUModelRunner."
+            "_check_and_update_cudagraph_mode"
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "remember_dflash_graph_modes"
+        ) as remember,
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "dflash_diagnostic_enabled",
+            return_value=True,
+        ),
+    ):
+        runner._check_and_update_cudagraph_mode([], [])
+
+    assert runner._dflash_requested_cudagraph_mode_310 == CUDAGraphMode.FULL
+    assert (
+        runner._dflash_effective_cudagraph_mode_310
+        == CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    remember.assert_called_once_with(
+        config,
+        requested_mode=CUDAGraphMode.FULL,
+        normalized_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+
+
+def test_dflash_early_fallback_effective_mode_drives_dispatch() -> None:
+    runner, _ = _make_k15_spec_runner(
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    runner._dflash_requested_cudagraph_mode_310 = CUDAGraphMode.FULL
+    runner._dflash_effective_cudagraph_mode_310 = (
+        CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.asarray([0], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+
+    with (
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runtime_mode, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=7,
+            num_reqs=1,
+            num_scheduled_tokens_np=np.asarray([7], dtype=np.int32),
+            max_num_scheduled_tokens=7,
+            use_cascade_attn=False,
+        )
+
+    assert runtime_mode == CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "normalized_mode"),
+    [
+        pytest.param(
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+            CUDAGraphMode.PIECEWISE,
+            id="combined-to-piecewise",
+        ),
+        pytest.param(
+            CUDAGraphMode.FULL,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+            id="full-to-combined",
+        ),
+    ],
+)
+def test_dflash_unmarked_backend_normalization_does_not_expand_runtime(
+    requested_mode: CUDAGraphMode,
+    normalized_mode: CUDAGraphMode,
+) -> None:
+    runner, _ = _make_k15_spec_runner(requested_mode)
+    runner.compilation_config = runner.vllm_config.compilation_config
+
+    def normalize(*_args, **_kwargs):
+        runner.compilation_config.cudagraph_mode = normalized_mode
+        runner.cudagraph_dispatcher.cudagraph_mode = normalized_mode
+
+    with (
+        patch(
+            "vllm_ascend._310p.model_runner_310p.NPUModelRunner."
+            "_check_and_update_cudagraph_mode",
+            side_effect=normalize,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runner._check_and_update_cudagraph_mode([], [])
+
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.asarray([0], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+    with (
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runtime_mode, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=7,
+            num_reqs=1,
+            num_scheduled_tokens_np=np.asarray([7], dtype=np.int32),
+            max_num_scheduled_tokens=7,
+            use_cascade_attn=False,
+        )
+
+    assert runtime_mode == CUDAGraphMode.NONE
+
+
 def _prepare_inputs_source() -> str:
     source_path = Path(__file__).resolve().parents[3] / "vllm_ascend" / "_310p" / "model_runner_310p.py"
     source = source_path.read_text(encoding="utf-8")

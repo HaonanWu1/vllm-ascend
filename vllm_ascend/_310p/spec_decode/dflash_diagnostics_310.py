@@ -152,12 +152,22 @@ def _mode_name(mode: Any) -> str:
 def _graph_mode_names(vllm_config: Any) -> tuple[str, str]:
     modes = _graph_modes.get(id(vllm_config))
     if modes is None:
+        compilation_config = getattr(
+            vllm_config,
+            "compilation_config",
+            None,
+        )
         normalized_mode = getattr(
-            getattr(vllm_config, "compilation_config", None),
+            compilation_config,
             "cudagraph_mode",
             CUDAGraphMode.NONE,
         )
-        modes = (normalized_mode, normalized_mode)
+        requested_mode = getattr(
+            compilation_config,
+            "_dflash_requested_cudagraph_mode_310",
+            normalized_mode,
+        )
+        modes = (requested_mode, normalized_mode)
     return _mode_name(modes[0]), _mode_name(modes[1])
 
 
