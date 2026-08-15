@@ -1125,6 +1125,126 @@ def test_draft_wrapper_captures_full_graph_padded_inputs_before_replay():
     assert payload["configured_graph_mode"] == "FULL_DECODE_ONLY"
 
 
+def test_draft_wrapper_diagnostic_introspection_failure_preserves_inference(
+    tmp_path: Path,
+):
+    class RaisingLanguageModel:
+        @property
+        def embed_tokens(self):
+            raise RuntimeError("diagnostic-only embedding failure")
+
+    proposer = object.__new__(AscendSpecDecodeBaseProposer310)
+    proposer.method = "dflash"
+    proposer.vllm_config = _dflash_graph_config()
+    proposer.runner = SimpleNamespace(_spec_dummy_capture=False)
+    proposer.model = SimpleNamespace(model=RaisingLanguageModel())
+    proposer.input_ids = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
+    proposer._get_positions = MagicMock(return_value=torch.arange(4))
+    result = torch.tensor([[31, 32, 33]], dtype=torch.int32)
+    output = tmp_path / "introspection-failure.jsonl"
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
+            clear=False,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "_original_run_merged_draft",
+            return_value=result,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "capture_current_dflash_graph_dispatch"
+        ),
+    ):
+        _reset_dflash_diagnostics_for_test()
+        actual = proposer._run_merged_draft(
+            num_input_tokens=4,
+            batch_size=1,
+            token_indices_to_sample=torch.tensor([3]),
+            target_positions=torch.arange(4),
+            inputs_embeds=None,
+            multi_steps_attn_metadata=[SimpleNamespace()],
+            num_tokens=4,
+        )
+    _reset_dflash_diagnostics_for_test()
+
+    torch.testing.assert_close(actual, result)
+    records = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["stage"] for record in records] == ["draft_output"]
+
+
+def test_draft_wrapper_does_not_inspect_embedding_after_stage_quota(
+    tmp_path: Path,
+):
+    class SingleUseLanguageModel:
+        accesses = 0
+
+        @property
+        def embed_tokens(self):
+            self.accesses += 1
+            if self.accesses > 1:
+                raise AssertionError("exhausted stage must not inspect embedding")
+            return None
+
+    language_model = SingleUseLanguageModel()
+    proposer = object.__new__(AscendSpecDecodeBaseProposer310)
+    proposer.method = "dflash"
+    proposer.vllm_config = _dflash_graph_config()
+    proposer.runner = SimpleNamespace(_spec_dummy_capture=False)
+    proposer.model = SimpleNamespace(model=language_model)
+    proposer.input_ids = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
+    proposer._get_positions = MagicMock(return_value=torch.arange(4))
+    result = torch.tensor([[31, 32, 33]], dtype=torch.int32)
+    output = tmp_path / "bounded-introspection.jsonl"
+    env = {
+        "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
+        "ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "1",
+    }
+
+    with (
+        patch.dict(os.environ, env, clear=False),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "_original_run_merged_draft",
+            return_value=result,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "capture_current_dflash_graph_dispatch"
+        ),
+    ):
+        _reset_dflash_diagnostics_for_test()
+        first = proposer._run_merged_draft(
+            4,
+            1,
+            torch.tensor([3]),
+            torch.arange(4),
+            None,
+            [SimpleNamespace()],
+            4,
+        )
+        second = proposer._run_merged_draft(
+            4,
+            1,
+            torch.tensor([3]),
+            torch.arange(4),
+            None,
+            [SimpleNamespace()],
+            4,
+        )
+    _reset_dflash_diagnostics_for_test()
+
+    torch.testing.assert_close(first, result)
+    torch.testing.assert_close(second, result)
+    assert language_model.accesses == 1
+
+
 def test_draft_wrapper_skips_returned_tokens_during_spec_dummy_capture():
     proposer = object.__new__(AscendSpecDecodeBaseProposer310)
     proposer.method = "dflash"

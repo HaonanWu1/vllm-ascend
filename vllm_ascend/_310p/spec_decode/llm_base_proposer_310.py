@@ -164,9 +164,9 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
             )
         )
         if capture_diagnostics and not in_spec_dummy_capture:
-            embedding_diagnostic = _describe_dflash_embedding_310(self)
 
             def _runtime_inputs_payload() -> dict[str, Any]:
+                embedding_diagnostic = _describe_dflash_embedding_310(self)
                 input_ids = self.input_ids[:num_input_tokens]
                 positions = self._get_positions(num_input_tokens)
                 return {
