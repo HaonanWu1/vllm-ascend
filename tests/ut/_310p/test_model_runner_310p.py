@@ -256,11 +256,27 @@ def test_k15_dflash_piecewise_target_and_draft_dispatch_integration(
     )
 
 
-def test_k15_dflash_full_decode_only_target_and_real_draft_path() -> None:
-    """Keep prefill/mixed eager and share FULL decode capture inputs."""
-    runner, dispatcher = _make_k15_spec_runner(
-        CUDAGraphMode.FULL_DECODE_ONLY
-    )
+@pytest.mark.parametrize(
+    ("requested_mode", "non_decode_mode"),
+    [
+        pytest.param(
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            CUDAGraphMode.NONE,
+            id="full-decode-only",
+        ),
+        pytest.param(
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+            CUDAGraphMode.PIECEWISE,
+            id="full-and-piecewise",
+        ),
+    ],
+)
+def test_k15_dflash_full_decode_target_and_real_draft_path(
+    requested_mode: CUDAGraphMode,
+    non_decode_mode: CUDAGraphMode,
+) -> None:
+    """Compose the requested non-decode path with shared FULL decode inputs."""
+    runner, dispatcher = _make_k15_spec_runner(requested_mode)
     runner.vllm_config.model_config.use_mla = False
     runner.dynamic_eplb = False
     runner.pcp_manager = None
@@ -437,14 +453,14 @@ def test_k15_dflash_full_decode_only_target_and_real_draft_path() -> None:
             AscendAttentionState.ChunkedPrefill,
             [7],
             [0],
-            CUDAGraphMode.NONE,
+            non_decode_mode,
             16,
         ),
         (
             AscendAttentionState.ChunkedPrefill,
             [7, 16],
             [0, 32],
-            CUDAGraphMode.NONE,
+            non_decode_mode,
             32,
         ),
         (
@@ -572,7 +588,6 @@ def test_k15_dflash_full_decode_only_target_and_real_draft_path() -> None:
                     sampling_metadata=SimpleNamespace(),
                 )
 
-            assert target_mode == expected_mode
             assert draft_modes[-1] == expected_mode
             assert [
                 call.kwargs["uniform_decode"]
@@ -582,6 +597,7 @@ def test_k15_dflash_full_decode_only_target_and_real_draft_path() -> None:
                 call.kwargs["num_tokens"]
                 for call in draft_dispatch.call_args_list
             ] == [16 * len(scheduled), expected_synced_tokens]
+            assert target_mode == expected_mode
 
     assert metadata_pointers["runtime-2"] == metadata_pointers["capture"]
 

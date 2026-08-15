@@ -208,16 +208,19 @@ class NPUModelRunner310(NPUModelRunner):
         num_encoder_reqs: int = 0,
     ):
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
+        requested_cudagraph_mode = getattr(
+            self,
+            "_dflash_requested_cudagraph_mode_310",
+            CUDAGraphMode.NONE,
+        )
         dflash_piecewise = (
             self.speculative_config is not None
             and self.speculative_config.method == "dflash"
-            and getattr(
-                self,
-                "_dflash_requested_cudagraph_mode_310",
-                CUDAGraphMode.NONE,
+            and requested_cudagraph_mode == self.cudagraph_dispatcher.cudagraph_mode
+            and requested_cudagraph_mode in (
+                CUDAGraphMode.PIECEWISE,
+                CUDAGraphMode.FULL_AND_PIECEWISE,
             )
-            == CUDAGraphMode.PIECEWISE
-            and self.cudagraph_dispatcher.cudagraph_mode == CUDAGraphMode.PIECEWISE
         )
 
         if (
