@@ -683,6 +683,98 @@ def test_graph_observer_rejects_changed_draft_persistent_input(
             _reset_dflash_diagnostics_for_test()
 
 
+def test_draft_full_graph_observer_captures_fixed_capacity_indices_before_replay(
+    tmp_path: Path,
+):
+    class DraftOwner:
+        method = "dflash"
+
+        def __init__(self):
+            self.input_ids = torch.arange(100, 112, dtype=torch.int32)
+            self.positions = torch.arange(200, 212, dtype=torch.int32)
+
+        def run(self):
+            return "result"
+
+    output = tmp_path / "draft-runtime-indices.jsonl"
+    config = _dflash_graph_config()
+    descriptor = BatchDescriptor(
+        num_tokens=8,
+        num_reqs=1,
+        uniform=True,
+        has_lora=False,
+        num_active_loras=0,
+    )
+    owner = DraftOwner()
+    entries = {}
+    wrapper = SimpleNamespace(
+        vllm_config=config,
+        runtime_mode=CUDAGraphMode.FULL,
+        concrete_aclgraph_entries=entries,
+        runnable=owner.run,
+    )
+    forward_context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        batch_descriptor=descriptor,
+        attn_metadata={},
+        no_compile_layers={},
+    )
+
+    def run_graph(_wrapper, *_args, **_kwargs):
+        entries.setdefault(descriptor, SimpleNamespace(aclgraph=object()))
+        return "result"
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
+                "ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "4",
+                "ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS": "16",
+            },
+            clear=False,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.dflash_diagnostics_310."
+            "_original_acl_graph_call_310",
+            side_effect=run_graph,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.dflash_diagnostics_310."
+            "get_forward_context",
+            return_value=forward_context,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.dflash_diagnostics_310."
+            "_is_draft_graph_path",
+            return_value=True,
+        ),
+    ):
+        _reset_dflash_diagnostics_for_test()
+        try:
+            assert observe_dflash_acl_graph_call_310(wrapper) == "result"
+            assert observe_dflash_acl_graph_call_310(wrapper) == "result"
+        finally:
+            _reset_dflash_diagnostics_for_test()
+
+    records = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    runtime_records = [
+        record
+        for record in records
+        if record["stage"] == "draft_graph_runtime_indices"
+    ]
+    assert len(runtime_records) == 1
+    runtime = runtime_records[0]
+    assert runtime["descriptor_num_tokens"] == 8
+    assert runtime["input_ids"]["values"] == list(range(100, 108))
+    assert runtime["positions"]["values"] == list(range(200, 208))
+    assert runtime["input_ids_data_ptr"] == owner.input_ids.data_ptr()
+    assert runtime["positions_data_ptr"] == owner.positions.data_ptr()
+
+
 @pytest.mark.parametrize(
     "changed_field",
     [
@@ -936,11 +1028,101 @@ def test_draft_wrapper_captures_returned_tokens_only_for_dflash():
         proposer.vllm_config,
         path="draft",
     )
-    capture.assert_called_once()
-    assert capture.call_args.args == ("draft_output",)
-    payload = capture.call_args.kwargs["payload_builder"]()
+    assert [call.args[0] for call in capture.call_args_list] == [
+        "draft_runtime_inputs",
+        "draft_output",
+    ]
+    payload = capture.call_args_list[1].kwargs["payload_builder"]()
     torch.testing.assert_close(payload["draft_token_ids"], result)
     torch.testing.assert_close(payload["token_indices_to_sample"], token_indices)
+
+
+def test_draft_wrapper_captures_full_graph_padded_inputs_before_replay():
+    class FakeEmbedding:
+        tp_size = 2
+
+        def __init__(self):
+            self.weight = torch.empty((5, 3))
+            self.quant_method = SimpleNamespace()
+            self._dflash_graph_embedding_output_310 = torch.empty((8, 3))
+
+        def _forward_origin(self, input_ids):
+            return input_ids
+
+        def _use_dflash_full_graph_output_310(self):
+            return True
+
+    proposer = object.__new__(AscendSpecDecodeBaseProposer310)
+    proposer.method = "dflash"
+    proposer.vllm_config = _dflash_graph_config()
+    proposer.runner = SimpleNamespace(_spec_dummy_capture=False)
+    proposer.model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=FakeEmbedding())
+    )
+    proposer.input_ids = torch.tensor(
+        [11, 12, 13, 14, 999, 1000],
+        dtype=torch.int32,
+    )
+    positions = torch.tensor([21, 22, 23, 24, 777, 778], dtype=torch.int32)
+    proposer._get_positions = MagicMock(return_value=positions)
+
+    with (
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "_original_run_merged_draft",
+            return_value=torch.tensor([[31, 32, 33]], dtype=torch.int32),
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "dflash_diagnostic_enabled",
+            return_value=True,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "capture_dflash_diagnostic"
+        ) as capture,
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "capture_current_dflash_graph_dispatch"
+        ),
+    ):
+        proposer._run_merged_draft(
+            num_input_tokens=6,
+            batch_size=1,
+            token_indices_to_sample=torch.tensor([3]),
+            target_positions=torch.arange(4),
+            inputs_embeds=None,
+            multi_steps_attn_metadata=[SimpleNamespace()],
+            num_tokens=4,
+        )
+
+    assert [call.args[0] for call in capture.call_args_list] == [
+        "draft_runtime_inputs",
+        "draft_output",
+    ]
+    payload = capture.call_args_list[0].kwargs["payload_builder"]()
+    assert payload["num_input_tokens"] == 6
+    assert payload["num_active_tokens"] == 4
+    torch.testing.assert_close(payload["input_ids"], proposer.input_ids)
+    torch.testing.assert_close(payload["positions"], positions)
+    assert payload["input_ids_data_ptr"] == proposer.input_ids.data_ptr()
+    assert payload["positions_data_ptr"] == positions.data_ptr()
+    assert payload["embedding_type"].endswith(".FakeEmbedding")
+    assert payload["embedding_forward_origin"].endswith(
+        ".FakeEmbedding._forward_origin"
+    )
+    assert payload["embedding_tp_size"] == 2
+    assert payload["embedding_graph_output_eligible"] is True
+    assert payload["embedding_has_persistent_output"] is True
+    output = proposer.model.model.embed_tokens._dflash_graph_embedding_output_310
+    assert payload["embedding_persistent_output_data_ptr"] == output.data_ptr()
+    assert payload["embedding_persistent_output_alignment_512"] == (
+        output.data_ptr() % 512
+    )
+    weight = proposer.model.model.embed_tokens.weight
+    assert payload["embedding_weight_data_ptr"] == weight.data_ptr()
+    assert payload["embedding_quant_method_type"].endswith(".SimpleNamespace")
+    assert payload["configured_graph_mode"] == "FULL_DECODE_ONLY"
 
 
 def test_draft_wrapper_skips_returned_tokens_during_spec_dummy_capture():

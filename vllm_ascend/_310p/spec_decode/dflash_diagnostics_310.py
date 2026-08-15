@@ -541,6 +541,52 @@ def assert_dflash_graph_tensor_addresses_310(
     )
 
 
+def _capture_draft_graph_runtime_indices_310(
+    batch_descriptor: BatchDescriptor,
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    """Record the fixed-capacity index prefix consumed by a draft replay."""
+    input_ids = tensors.get("input.input_ids")
+    positions = next(
+        (
+            tensors.get(name)
+            for name in (
+                "position.positions",
+                "position.mrope_positions",
+                "position.xdrope_positions",
+            )
+            if tensors.get(name) is not None
+        ),
+        None,
+    )
+    if input_ids is None or positions is None:
+        return
+
+    num_tokens = batch_descriptor.num_tokens
+    if num_tokens is None or num_tokens <= 0:
+        return
+
+    def _payload() -> dict[str, Any]:
+        graph_input_ids = input_ids[:num_tokens]
+        graph_positions = (
+            positions[:num_tokens]
+            if positions.ndim == 1
+            else positions[..., :num_tokens]
+        )
+        return {
+            "descriptor_num_tokens": num_tokens,
+            "input_ids": graph_input_ids,
+            "positions": graph_positions,
+            "input_ids_data_ptr": graph_input_ids.data_ptr(),
+            "positions_data_ptr": graph_positions.data_ptr(),
+        }
+
+    capture_dflash_diagnostic(
+        "draft_graph_runtime_indices",
+        payload_builder=_payload,
+    )
+
+
 def observe_dflash_acl_graph_call_310(self: ACLGraphWrapper, *args: Any, **kwargs: Any) -> Any:
     """Observe successful 310P DFlash ACL graph captures and replays.
 
@@ -597,6 +643,11 @@ def observe_dflash_acl_graph_call_310(self: ACLGraphWrapper, *args: Any, **kwarg
                 action=action,
                 tensors=graph_tensors,
             )
+            if path == "draft":
+                _capture_draft_graph_runtime_indices_310(
+                    batch_descriptor,
+                    graph_tensors,
+                )
 
     result = _original_acl_graph_call_310(self, *args, **kwargs)
     if action is None:

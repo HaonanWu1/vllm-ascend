@@ -35,6 +35,106 @@ from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBasePropos
 _original_run_merged_draft = AscendSpecDecodeBaseProposer._run_merged_draft
 
 
+def _describe_dflash_embedding_310(proposer: Any) -> dict[str, Any]:
+    """Describe the real shared embedding selected by the 310P draft path."""
+    draft_model = getattr(proposer, "model", None)
+    language_model = getattr(draft_model, "model", None)
+    embedding = getattr(language_model, "embed_tokens", None)
+    configured_mode = getattr(
+        getattr(
+            getattr(proposer, "vllm_config", None),
+            "compilation_config",
+            None,
+        ),
+        "cudagraph_mode",
+        None,
+    )
+    if embedding is None:
+        return {
+            "embedding_type": None,
+            "embedding_forward_origin": None,
+            "embedding_tp_size": None,
+            "embedding_graph_output_eligible": None,
+            "embedding_graph_output_eligibility_error": None,
+            "embedding_has_persistent_output": False,
+            "embedding_persistent_output_data_ptr": None,
+            "embedding_persistent_output_alignment_512": None,
+            "embedding_weight_data_ptr": None,
+            "embedding_quant_method_type": None,
+            "configured_graph_mode": getattr(
+                configured_mode,
+                "name",
+                str(configured_mode),
+            ),
+        }
+
+    embedding_type = type(embedding)
+    forward_origin = getattr(embedding, "_forward_origin", None)
+    forward_function = getattr(forward_origin, "__func__", forward_origin)
+    forward_name = None
+    if forward_function is not None:
+        forward_name = (
+            f"{getattr(forward_function, '__module__', '')}."
+            f"{getattr(forward_function, '__qualname__', type(forward_function).__qualname__)}"
+        ).lstrip(".")
+
+    eligible = None
+    eligibility_error = None
+    eligibility_check = getattr(
+        embedding,
+        "_use_dflash_full_graph_output_310",
+        None,
+    )
+    if callable(eligibility_check):
+        try:
+            eligible = bool(eligibility_check())
+        except Exception as exc:  # noqa: BLE001
+            eligibility_error = f"{type(exc).__name__}: {exc}"
+
+    persistent_output = getattr(
+        embedding,
+        "_dflash_graph_embedding_output_310",
+        None,
+    )
+    persistent_output_data_ptr = (
+        persistent_output.data_ptr()
+        if isinstance(persistent_output, torch.Tensor)
+        else None
+    )
+    weight = getattr(embedding, "weight", None)
+    weight_data_ptr = weight.data_ptr() if isinstance(weight, torch.Tensor) else None
+    quant_method = getattr(embedding, "quant_method", None)
+    quant_method_type = type(quant_method) if quant_method is not None else None
+
+    return {
+        "embedding_type": (
+            f"{embedding_type.__module__}.{embedding_type.__qualname__}"
+        ),
+        "embedding_forward_origin": forward_name,
+        "embedding_tp_size": getattr(embedding, "tp_size", None),
+        "embedding_graph_output_eligible": eligible,
+        "embedding_graph_output_eligibility_error": eligibility_error,
+        "embedding_has_persistent_output": persistent_output_data_ptr is not None,
+        "embedding_persistent_output_data_ptr": persistent_output_data_ptr,
+        "embedding_persistent_output_alignment_512": (
+            persistent_output_data_ptr % 512
+            if persistent_output_data_ptr is not None
+            else None
+        ),
+        "embedding_weight_data_ptr": weight_data_ptr,
+        "embedding_quant_method_type": (
+            f"{quant_method_type.__module__}.{quant_method_type.__qualname__}"
+            if quant_method_type is not None
+            else None
+        ),
+        "configured_graph_mode": getattr(
+            configured_mode,
+            "name",
+            str(configured_mode),
+        ),
+    }
+
+
 class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
     """310P proposer overrides for NPU-specific spec-decode workarounds."""
 
@@ -55,6 +155,33 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
             capture_current_dflash_graph_dispatch(
                 self.vllm_config,
                 path="draft",
+            )
+        in_spec_dummy_capture = capture_diagnostics and bool(
+            getattr(
+                getattr(self, "runner", None),
+                "_spec_dummy_capture",
+                False,
+            )
+        )
+        if capture_diagnostics and not in_spec_dummy_capture:
+            embedding_diagnostic = _describe_dflash_embedding_310(self)
+
+            def _runtime_inputs_payload() -> dict[str, Any]:
+                input_ids = self.input_ids[:num_input_tokens]
+                positions = self._get_positions(num_input_tokens)
+                return {
+                    "num_input_tokens": num_input_tokens,
+                    "num_active_tokens": num_tokens,
+                    "input_ids": input_ids,
+                    "positions": positions,
+                    "input_ids_data_ptr": input_ids.data_ptr(),
+                    "positions_data_ptr": positions.data_ptr(),
+                    **embedding_diagnostic,
+                }
+
+            capture_dflash_diagnostic(
+                "draft_runtime_inputs",
+                payload_builder=_runtime_inputs_payload,
             )
         rope_capacity = (
             reserve_draft_rope_capacity_310p(
@@ -78,13 +205,6 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
                 )
         finally:
             AscendRotaryEmbedding310.set_rope_position_flag_310p(False)
-        in_spec_dummy_capture = capture_diagnostics and bool(
-            getattr(
-                getattr(self, "runner", None),
-                "_spec_dummy_capture",
-                False,
-            )
-        )
         if capture_diagnostics and not in_spec_dummy_capture:
             capture_dflash_diagnostic(
                 "draft_output",
