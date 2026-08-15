@@ -15,6 +15,7 @@
 
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -27,11 +28,20 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
+from vllm_ascend._310p.attention.metadata_builder import (
+    AscendAttentionMetadataBuilder310,
+)
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+    wrap_dummy_run_with_draft_flag,
+)
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
     _reset_dflash_diagnostics_for_test,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.spec_decode.llm_base_proposer import (
+    AscendSpecDecodeBaseProposer,
+)
 
 
 _DFLASH_GRAPH_RUNTIME_CONTRACT = {
@@ -244,6 +254,336 @@ def test_k15_dflash_piecewise_target_and_draft_dispatch_integration(
     ), (
         f"{batch_kind}: target={target_mode.name}, draft={draft_mode.name}"
     )
+
+
+def test_k15_dflash_full_decode_only_target_and_real_draft_path() -> None:
+    """Keep prefill/mixed eager and share FULL decode capture inputs."""
+    runner, dispatcher = _make_k15_spec_runner(
+        CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    runner.vllm_config.model_config.use_mla = False
+    runner.dynamic_eplb = False
+    runner.pcp_manager = None
+    synced_draft_tokens = 0
+
+    def sync_draft_tokens(num_tokens, is_draft_model):
+        assert is_draft_model
+        return synced_draft_tokens or num_tokens, synced_draft_tokens, False
+
+    def pad_query_start_loc(
+        query_start_loc,
+        num_tokens_padded,
+        num_reqs_padded,
+        num_reqs,
+        *args,
+    ):
+        tail = torch.arange(
+            num_reqs + 1,
+            num_reqs_padded + 1,
+            dtype=torch.int32,
+        )
+        tail.mul_(16)
+        query_start_loc.gpu[num_reqs + 1 : num_reqs_padded + 1].copy_(
+            tail
+        )
+        query_start_loc.cpu[num_reqs + 1 : num_reqs_padded + 1].copy_(
+            tail
+        )
+        return num_reqs_padded
+
+    runner._sync_metadata_across_dp = sync_draft_tokens
+    runner._pad_query_start_loc_for_fia = pad_query_start_loc
+
+    class FakeDFlashModel:
+        def __init__(self) -> None:
+            self.model = SimpleNamespace(_attn_layers=[])
+
+        @staticmethod
+        def combine_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states
+
+    draft_model = FakeDFlashModel()
+    runner.get_model = lambda: draft_model
+
+    builder = object.__new__(AscendAttentionMetadataBuilder310)
+    builder.device = torch.device("cpu")
+    builder._query_lens_cpu_buffer = torch.zeros(8, dtype=torch.int32)
+
+    proposer = object.__new__(AscendSpecDecodeBaseProposer)
+    proposer.method = "dflash"
+    proposer.model = draft_model
+    proposer.get_model = lambda: draft_model
+    proposer.hidden_size = 4
+    proposer.runner = runner
+    proposer.vllm_config = runner.vllm_config
+    proposer.use_cuda_graph = True
+    proposer.use_compress = False
+    proposer.pcp_size = 1
+    proposer.dcp_size = 1
+    proposer.decode_threshold = 16
+    proposer.query_start_loc = SimpleNamespace(
+        gpu=torch.zeros(9, dtype=torch.int32),
+        cpu=torch.zeros(9, dtype=torch.int32),
+    )
+    proposer.draft_window_size = None
+    proposer.supports_mm_inputs = False
+    proposer.slot_mapping_group = [
+        torch.full((128,), -1, dtype=torch.int32)
+    ]
+    proposer.seq_lens_group = [torch.zeros(8, dtype=torch.int32)]
+    proposer.query_start_loc_group = [
+        torch.zeros(9, dtype=torch.int32)
+    ]
+    proposer.draft_attn_groups = [
+        SimpleNamespace(
+            get_metadata_builder=lambda: builder,
+            kv_cache_spec=SimpleNamespace(block_size=128),
+        )
+    ]
+    proposer.attn_layer_names = ["model.layers.0.self_attn.attn"]
+    proposer.uses_mrope = False
+    proposer.positions = torch.arange(128, dtype=torch.int32)
+    proposer.parallel_drafting = True
+    proposer.num_speculative_tokens = 15
+    proposer.token_indices_to_sample = torch.zeros(128, dtype=torch.int32)
+    proposer.enable_enpu = False
+    proposer.max_num_tokens = 128
+    proposer.max_query_tokens = 128
+    def adjust_tensor(tensor, length):
+        if tensor.shape[0] >= length:
+            return tensor[:length]
+        padded = torch.zeros(
+            (length, *tensor.shape[1:]),
+            dtype=tensor.dtype,
+        )
+        padded[: tensor.shape[0]].copy_(tensor)
+        return padded
+
+    proposer._adjust_tensor = adjust_tensor
+    proposer._update_full_graph_params_if_needed = lambda *args: None
+    proposer._runnable = lambda **kwargs: torch.zeros(
+        kwargs["batch_size"], dtype=torch.int32
+    )
+
+    phase = "capture"
+    metadata_pointers: dict[str, dict[str, int]] = {}
+
+    def build_base_metadata(_, common, *args, **kwargs):
+        metadata_pointers[phase] = {
+            "query_start_loc": common.query_start_loc.data_ptr(),
+            "seq_lens": common.seq_lens.data_ptr(),
+            "slot_mapping": common.slot_mapping.data_ptr(),
+        }
+        return SimpleNamespace(
+            attn_state=AscendAttentionState.ChunkedPrefill,
+            causal=False,
+            num_prefills=0,
+            attn_mask=None,
+        )
+
+    def make_common_metadata(num_reqs: int) -> SimpleNamespace:
+        num_tokens = 16 * num_reqs
+        query_start_loc = torch.arange(
+            0,
+            num_tokens + 1,
+            16,
+            dtype=torch.int32,
+        )
+        return SimpleNamespace(
+            batch_size=lambda: num_reqs,
+            query_start_loc=query_start_loc.clone(),
+            query_start_loc_cpu=query_start_loc.clone(),
+            seq_lens=torch.arange(
+                20,
+                20 + num_reqs,
+                dtype=torch.int32,
+            ),
+            seq_lens_cpu=None,
+            _seq_lens_cpu=None,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=16,
+            block_table_tensor=torch.zeros(
+                num_reqs,
+                8,
+                dtype=torch.int32,
+            ),
+            slot_mapping=torch.arange(num_tokens, dtype=torch.int32),
+            causal=False,
+            num_computed_tokens_cpu=None,
+        )
+
+    def capture_draft(self, **kwargs):
+        return builder.build(0, make_common_metadata(4))
+
+    captured_context = None
+    draft_modes: list[CUDAGraphMode] = []
+
+    @contextmanager
+    def record_forward_context(*args, **kwargs):
+        nonlocal captured_context
+        captured_context = SimpleNamespace(
+            cudagraph_runtime_mode=kwargs["aclgraph_runtime_mode"],
+            moe_layer_index=None,
+        )
+        draft_modes.append(captured_context.cudagraph_runtime_mode)
+        try:
+            yield captured_context
+        finally:
+            captured_context = None
+
+    cases = [
+        (
+            AscendAttentionState.ChunkedPrefill,
+            [7],
+            [0],
+            CUDAGraphMode.NONE,
+            16,
+        ),
+        (
+            AscendAttentionState.ChunkedPrefill,
+            [7, 16],
+            [0, 32],
+            CUDAGraphMode.NONE,
+            32,
+        ),
+        (
+            AscendAttentionState.SpecDecoding,
+            [16, 16],
+            [32, 48],
+            CUDAGraphMode.FULL,
+            64,
+        ),
+    ]
+
+    with (
+        patch.object(
+            AscendAttentionMetadataBuilder310.__bases__[0],
+            "build",
+            side_effect=build_base_metadata,
+        ),
+        patch(
+            "vllm_ascend._310p.attention.metadata_builder."
+            "is_compressed_mask_supported",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+            "_prepare_dflash_full_graph_capture_310",
+            create=True,
+            side_effect=lambda owner, **kwargs: setattr(
+                builder,
+                "_dflash_full_graph_owner_310",
+                owner,
+            ),
+        ),
+        patch(
+            "vllm_ascend.spec_decode.llm_base_proposer."
+            "DFlashQwen3ForCausalLM",
+            FakeDFlashModel,
+        ),
+        patch(
+            "vllm_ascend.spec_decode.llm_base_proposer."
+            "set_ascend_forward_context",
+            side_effect=record_forward_context,
+        ),
+        patch(
+            "vllm_ascend.spec_decode.llm_base_proposer.get_forward_context",
+            side_effect=lambda: captured_context,
+        ),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        wrap_dummy_run_with_draft_flag(capture_draft)(
+            proposer,
+            num_tokens=64,
+            num_reqs=4,
+            aclgraph_runtime_mode=CUDAGraphMode.FULL,
+        )
+
+        for case_index, (
+            attn_state,
+            scheduled_tokens,
+            computed_tokens,
+            expected_mode,
+            expected_synced_tokens,
+        ) in enumerate(cases):
+            scheduled = np.asarray(scheduled_tokens, dtype=np.int32)
+            runner.attn_state = attn_state
+            runner.input_batch = SimpleNamespace(
+                num_computed_tokens_cpu=np.asarray(
+                    computed_tokens,
+                    dtype=np.int32,
+                ),
+                lora_id_to_lora_request={},
+            )
+            target_mode, target_descriptor, *_ = (
+                runner._determine_batch_execution_and_padding(
+                    num_tokens=int(scheduled.sum()),
+                    num_reqs=len(scheduled),
+                    num_scheduled_tokens_np=scheduled,
+                    max_num_scheduled_tokens=int(scheduled.max()),
+                    use_cascade_attn=False,
+                )
+            )
+
+            common = make_common_metadata(len(scheduled))
+            sample_indices = torch.arange(
+                15,
+                16 * len(scheduled),
+                16,
+                dtype=torch.int32,
+            )
+            proposer.set_inputs_first_pass = lambda **kwargs: (
+                16 * len(scheduled),
+                sample_indices,
+                common,
+                None,
+            )
+            synced_draft_tokens = expected_synced_tokens
+            phase = f"runtime-{case_index}"
+            with patch.object(
+                dispatcher,
+                "dispatch",
+                wraps=dispatcher.dispatch,
+            ) as draft_dispatch:
+                proposer._propose(
+                    target_token_ids=torch.zeros(1, dtype=torch.int32),
+                    target_positions=torch.zeros(1, dtype=torch.int32),
+                    target_hidden_states=torch.zeros(1, 4),
+                    next_token_ids=torch.zeros(
+                        len(scheduled),
+                        dtype=torch.int32,
+                    ),
+                    token_indices_to_sample=sample_indices,
+                    common_attn_metadata=common,
+                    target_model_batch_desc=target_descriptor,
+                    sampling_metadata=SimpleNamespace(),
+                )
+
+            assert target_mode == expected_mode
+            assert draft_modes[-1] == expected_mode
+            assert [
+                call.kwargs["uniform_decode"]
+                for call in draft_dispatch.call_args_list
+            ] == [target_descriptor.uniform, target_descriptor.uniform]
+            assert [
+                call.kwargs["num_tokens"]
+                for call in draft_dispatch.call_args_list
+            ] == [16 * len(scheduled), expected_synced_tokens]
+
+    assert metadata_pointers["runtime-2"] == metadata_pointers["capture"]
 
 
 @pytest.mark.parametrize(
