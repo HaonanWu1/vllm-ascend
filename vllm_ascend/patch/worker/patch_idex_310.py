@@ -7,6 +7,10 @@ from vllm_ascend._310p.ops.fla.idex import (
     prepare_chunk_indices_310,
     prepare_chunk_offsets_310,
 )
+from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
+    dflash_diagnostic_enabled,
+    observe_dflash_acl_graph_call_310,
+)
 from vllm_ascend._310p.spec_decode.dflash_model_310 import (
     patch_dflash_read_mask_embedding_310,
     precompute_and_store_context_kv_310,
@@ -17,6 +21,7 @@ from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
     wrap_dummy_run_with_draft_flag,
 )
 from vllm_ascend._310p.spec_decode.llm_base_proposer_310 import AscendSpecDecodeBaseProposer310
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDsparkProposer
@@ -26,6 +31,12 @@ from vllm_ascend.utils import is_rc_device
 vllm.model_executor.layers.fla.ops.index.prepare_chunk_indices = prepare_chunk_indices_310
 
 vllm.model_executor.layers.fla.ops.index.prepare_chunk_offsets = prepare_chunk_offsets_310
+
+# Expose path-labelled capture/replay evidence only in the 310P process. The
+# observer delegates all behavior to the original wrapper and is lazy unless
+# opt-in DFlash diagnostics are enabled.
+if dflash_diagnostic_enabled():
+    ACLGraphWrapper.__call__ = observe_dflash_acl_graph_call_310
 
 # 310P: protect tail slot during MTP input_ids shift to avoid GatherV2 corruption
 # caused by the NPU slice-assign writing one element past the intended range

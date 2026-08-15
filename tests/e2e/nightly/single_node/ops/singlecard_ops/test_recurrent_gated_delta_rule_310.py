@@ -38,6 +38,136 @@ def npu_recurrent_gated_delta_rule_310(
     return out
 
 
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+def test_recurrent_k15_padded_request_does_not_update_live_state():
+    enable_custom_op()
+    torch.manual_seed(20260815)
+    seq_len = 16
+    num_k_heads = 16
+    num_v_heads = 16
+    head_dim = 128
+    dtype = torch.float16
+    scale = head_dim**-0.5
+
+    live_query = torch.nn.functional.normalize(
+        torch.randn(seq_len, num_k_heads, head_dim),
+        dim=-1,
+    ).to(dtype)
+    live_key = torch.nn.functional.normalize(
+        torch.randn(seq_len, num_k_heads, head_dim),
+        dim=-1,
+    ).to(dtype)
+    live_value = torch.randn(seq_len, num_v_heads, head_dim, dtype=dtype)
+    live_beta = torch.rand(seq_len, num_v_heads, dtype=dtype)
+    live_g = -torch.rand(seq_len, num_v_heads, dtype=torch.float32)
+    padding_query = torch.nn.functional.normalize(
+        torch.randn(seq_len, num_k_heads, head_dim),
+        dim=-1,
+    ).to(dtype)
+    padding_key = torch.nn.functional.normalize(
+        torch.randn(seq_len, num_k_heads, head_dim),
+        dim=-1,
+    ).to(dtype)
+    padding_value = torch.randn(
+        seq_len,
+        num_v_heads,
+        head_dim,
+        dtype=dtype,
+    )
+    padding_beta = 0.25 + 0.5 * torch.rand(
+        seq_len,
+        num_v_heads,
+        dtype=dtype,
+    )
+    padding_g = -0.25 - torch.rand(
+        seq_len,
+        num_v_heads,
+        dtype=torch.float32,
+    )
+    query = torch.cat([live_query, padding_query]).npu()
+    key = torch.cat([live_key, padding_key]).npu()
+    value = torch.cat([live_value, padding_value]).npu()
+    beta = torch.cat([live_beta, padding_beta]).npu()
+    g = torch.cat([live_g, padding_g]).npu()
+
+    initial_state = torch.randn(
+        seq_len + 1,
+        num_v_heads,
+        head_dim,
+        head_dim,
+        dtype=dtype,
+    )
+    live_indices = torch.arange(1, seq_len + 1, dtype=torch.int32)
+    live_state = initial_state.npu()
+    live_output = npu_recurrent_gated_delta_rule_310(
+        live_query.npu(),
+        live_key.npu(),
+        live_value.npu(),
+        live_beta.npu(),
+        live_state,
+        torch.tensor([seq_len], dtype=torch.int32).npu(),
+        live_indices.npu(),
+        g=live_g.npu(),
+        num_accepted_tokens=torch.tensor([15], dtype=torch.int32).npu(),
+        scale=scale,
+    )
+
+    padded_state = initial_state.npu()
+    padded_output = npu_recurrent_gated_delta_rule_310(
+        query,
+        key,
+        value,
+        beta,
+        padded_state,
+        torch.tensor([seq_len, 0], dtype=torch.int32).npu(),
+        torch.cat(
+            [live_indices, torch.zeros(seq_len, dtype=torch.int32)]
+        ).npu(),
+        g=g,
+        num_accepted_tokens=torch.tensor([15, 0], dtype=torch.int32).npu(),
+        scale=scale,
+    )
+    activated_padding_state = initial_state.npu()
+    npu_recurrent_gated_delta_rule_310(
+        query,
+        key,
+        value,
+        beta,
+        activated_padding_state,
+        torch.tensor([seq_len, seq_len], dtype=torch.int32).npu(),
+        torch.cat(
+            [live_indices, torch.zeros(seq_len, dtype=torch.int32)]
+        ).npu(),
+        g=g,
+        num_accepted_tokens=torch.tensor([15, 1], dtype=torch.int32).npu(),
+        scale=scale,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(
+        padded_output[:seq_len].cpu(),
+        live_output.cpu(),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        padded_state.cpu(),
+        live_state.cpu(),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        padded_state[0].cpu(),
+        initial_state[0],
+        atol=0,
+        rtol=0,
+    )
+    assert not torch.equal(
+        activated_padding_state[0].cpu(),
+        initial_state[0],
+    ), "the negative control must make an activated padded request observable"
+
+
 def golden_recurrent_gated_delta_rule(
     query,
     key,

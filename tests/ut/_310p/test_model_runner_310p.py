@@ -19,8 +19,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
@@ -28,6 +31,204 @@ from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
     _reset_dflash_diagnostics_for_test,
 )
+
+
+_DFLASH_GRAPH_RUNTIME_CONTRACT = {
+    CUDAGraphMode.NONE: {
+        "prefill": CUDAGraphMode.NONE,
+        "mixed": CUDAGraphMode.NONE,
+        "uniform_decode": CUDAGraphMode.NONE,
+    },
+    CUDAGraphMode.PIECEWISE: {
+        "prefill": CUDAGraphMode.PIECEWISE,
+        "mixed": CUDAGraphMode.PIECEWISE,
+        "uniform_decode": CUDAGraphMode.PIECEWISE,
+    },
+    CUDAGraphMode.FULL_DECODE_ONLY: {
+        "prefill": CUDAGraphMode.NONE,
+        "mixed": CUDAGraphMode.NONE,
+        "uniform_decode": CUDAGraphMode.FULL,
+    },
+    CUDAGraphMode.FULL_AND_PIECEWISE: {
+        "prefill": CUDAGraphMode.PIECEWISE,
+        "mixed": CUDAGraphMode.PIECEWISE,
+        "uniform_decode": CUDAGraphMode.FULL,
+    },
+    CUDAGraphMode.FULL: {
+        "prefill": CUDAGraphMode.FULL,
+        "mixed": CUDAGraphMode.FULL,
+        "uniform_decode": CUDAGraphMode.FULL,
+    },
+}
+
+
+def _make_k15_dflash_dispatcher(
+    requested_mode: CUDAGraphMode,
+) -> CudagraphDispatcher:
+    compilation_config = SimpleNamespace(
+        cudagraph_mode=requested_mode,
+        max_cudagraph_capture_size=128,
+        cudagraph_capture_sizes=[16, 32, 64, 128],
+        compile_sizes=[],
+        cudagraph_specialize_lora=True,
+        is_attention_compiled_piecewise=lambda: True,
+    )
+    vllm_config = SimpleNamespace(
+        compilation_config=compilation_config,
+        num_speculative_tokens=15,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        lora_config=None,
+    )
+    dispatcher = CudagraphDispatcher(vllm_config)
+    dispatcher.initialize_cudagraph_keys(requested_mode, 16)
+    return dispatcher
+
+
+@pytest.mark.parametrize("execution_path", ["target", "draft"])
+@pytest.mark.parametrize(
+    ("batch_kind", "num_tokens", "uniform_decode"),
+    [
+        pytest.param("prefill", 7, False, id="prefill"),
+        pytest.param("mixed", 23, False, id="mixed"),
+        pytest.param("uniform_decode", 32, True, id="k15-uniform-decode"),
+    ],
+)
+@pytest.mark.parametrize(
+    "requested_mode",
+    [
+        CUDAGraphMode.NONE,
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        CUDAGraphMode.FULL,
+    ],
+)
+def test_k15_dflash_graph_runtime_contract(
+    execution_path: str,
+    batch_kind: str,
+    num_tokens: int,
+    uniform_decode: bool,
+    requested_mode: CUDAGraphMode,
+) -> None:
+    """Target and draft dispatch independently to the required runtime mode."""
+    dispatcher = _make_k15_dflash_dispatcher(requested_mode)
+
+    runtime_mode, descriptor = dispatcher.dispatch(
+        num_tokens=num_tokens,
+        uniform_decode=uniform_decode,
+    )
+
+    expected_mode = _DFLASH_GRAPH_RUNTIME_CONTRACT[requested_mode][batch_kind]
+    assert runtime_mode == expected_mode, (
+        f"{execution_path} {batch_kind}: requested={requested_mode}, "
+        f"runtime={runtime_mode}"
+    )
+    if expected_mode == CUDAGraphMode.NONE:
+        assert descriptor.num_tokens == num_tokens
+    else:
+        assert descriptor.num_tokens >= num_tokens
+
+
+@pytest.mark.parametrize("diagnostic_enabled", [False, True])
+def test_target_dispatch_emits_path_labelled_dflash_graph_evidence(
+    diagnostic_enabled: bool,
+) -> None:
+    runner = object.__new__(NPUModelRunner310)
+    runner.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash")
+    )
+    runner.speculative_config = runner.vllm_config.speculative_config
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([3, 5], dtype=np.int32)
+    )
+    runner.attn_state = object()
+    runner.uniform_decode_query_len = 16
+    descriptor = SimpleNamespace(num_tokens=32)
+    parent_result = (
+        CUDAGraphMode.NONE,
+        descriptor,
+        False,
+        None,
+        None,
+    )
+
+    with (
+        patch(
+            "vllm_ascend._310p.model_runner_310p.NPUModelRunner."
+            "_determine_batch_execution_and_padding",
+            return_value=parent_result,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "capture_dflash_graph_dispatch"
+        ) as capture,
+        patch(
+            "vllm_ascend._310p.model_runner_310p.dflash_diagnostic_enabled",
+            return_value=diagnostic_enabled,
+        ),
+    ):
+        result = runner._determine_batch_execution_and_padding(
+            num_tokens=23,
+            num_reqs=2,
+            num_scheduled_tokens_np=np.array([7, 16], dtype=np.int32),
+            max_num_scheduled_tokens=16,
+            use_cascade_attn=False,
+        )
+
+    assert result is parent_result
+    if diagnostic_enabled:
+        capture.assert_called_once_with(
+            runner.vllm_config,
+            path="target",
+            runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=descriptor,
+        )
+    else:
+        capture.assert_not_called()
+
+
+@pytest.mark.parametrize("diagnostic_enabled", [False, True])
+def test_dflash_graph_mode_normalization_is_remembered(
+    diagnostic_enabled: bool,
+) -> None:
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash"),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL),
+    )
+    runner = object.__new__(NPUModelRunner310)
+    runner.vllm_config = config
+    runner.speculative_config = config.speculative_config
+    runner.compilation_config = config.compilation_config
+    runner.cudagraph_dispatcher = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+
+    def normalize(*_args, **_kwargs):
+        runner.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        runner.cudagraph_dispatcher.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
+    with (
+        patch(
+            "vllm_ascend._310p.model_runner_310p.NPUModelRunner."
+            "_check_and_update_cudagraph_mode",
+            side_effect=normalize,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.remember_dflash_graph_modes"
+        ) as remember,
+        patch(
+            "vllm_ascend._310p.model_runner_310p.dflash_diagnostic_enabled",
+            return_value=diagnostic_enabled,
+        ),
+    ):
+        runner._check_and_update_cudagraph_mode([], [])
+
+    if diagnostic_enabled:
+        remember.assert_called_once_with(
+            config,
+            requested_mode=CUDAGraphMode.FULL,
+            normalized_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        )
+    else:
+        remember.assert_not_called()
 
 
 def _prepare_inputs_source() -> str:

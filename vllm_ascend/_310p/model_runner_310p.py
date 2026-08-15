@@ -52,8 +52,10 @@ from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
+    capture_dflash_graph_dispatch,
     capture_dflash_diagnostic,
     dflash_diagnostic_enabled,
+    remember_dflash_graph_modes,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
@@ -228,7 +230,7 @@ class NPUModelRunner310(NPUModelRunner):
                 # Respect explicit caller override: only force when unset.
                 force_uniform_decode = True
 
-        return super()._determine_batch_execution_and_padding(
+        result = super()._determine_batch_execution_and_padding(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
@@ -241,6 +243,18 @@ class NPUModelRunner310(NPUModelRunner):
             force_num_active_loras=force_num_active_loras,
             num_encoder_reqs=num_encoder_reqs,
         )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dflash"
+            and dflash_diagnostic_enabled()
+        ):
+            capture_dflash_graph_dispatch(
+                self.vllm_config,
+                path="target",
+                runtime_mode=result[0],
+                batch_descriptor=result[1],
+            )
+        return result
 
     def _build_attention_metadata(self, *args: Any, **kwargs: Any):
         # Parent dummy_run assigns ChunkedPrefill for non-MLA MTP (910B FIA graph).
@@ -786,8 +800,20 @@ class NPUModelRunner310(NPUModelRunner):
     ) -> None:
         # 910B does not need this branch because runner/dispatcher query_len are
         # naturally consistent there. 310P ngram needs temporary alignment.
+        capture_graph_modes = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dflash"
+            and dflash_diagnostic_enabled()
+        )
+        requested_mode = self.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
         with self.temporary_modify_uniform_decode_query_len():
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
+        if capture_graph_modes:
+            remember_dflash_graph_modes(
+                self.vllm_config,
+                requested_mode=requested_mode,
+                normalized_mode=self.cudagraph_dispatcher.cudagraph_mode,
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """310P uses torch zeroing because Triton is not available."""

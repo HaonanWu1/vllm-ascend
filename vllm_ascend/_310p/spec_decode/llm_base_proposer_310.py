@@ -22,6 +22,7 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
+    capture_current_dflash_graph_dispatch,
     capture_dflash_diagnostic,
     dflash_diagnostic_enabled,
 )
@@ -45,6 +46,12 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
         is_prefill=None,
     ) -> torch.Tensor:
         AscendRotaryEmbedding310.set_rope_position_flag_310p(True)
+        capture_diagnostics = self.method == "dflash" and dflash_diagnostic_enabled()
+        if capture_diagnostics:
+            capture_current_dflash_graph_dispatch(
+                self.vllm_config,
+                path="draft",
+            )
         try:
             result = _original_run_merged_draft(
                 self,
@@ -59,7 +66,7 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
             )
         finally:
             AscendRotaryEmbedding310.set_rope_position_flag_310p(False)
-        if self.method == "dflash" and dflash_diagnostic_enabled():
+        if capture_diagnostics:
             capture_dflash_diagnostic(
                 "draft_output",
                 payload_builder=lambda: {

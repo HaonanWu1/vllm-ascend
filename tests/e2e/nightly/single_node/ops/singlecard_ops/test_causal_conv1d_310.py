@@ -149,6 +149,73 @@ def test_causal_conv1d_310_k15_repeated_state(has_bias):
 
 
 @pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+def test_causal_conv1d_310_k15_padded_request_does_not_update_live_state():
+    torch.manual_seed(20260815)
+    enable_custom_op()
+    device = "npu"
+    seq_len = 16
+    dim = 4096
+    width = 4
+    accepted_tokens = 15
+    state_len = width - 1 + seq_len - 1
+
+    live_x = torch.randn(seq_len, dim, device=device, dtype=torch.float16)
+    padded_x = torch.cat([live_x, torch.zeros_like(live_x)])
+    weight = torch.randn(width, dim, device=device, dtype=torch.float16)
+    initial_state = torch.randn(
+        2,
+        dim,
+        state_len,
+        device=device,
+        dtype=torch.float16,
+    )
+
+    live_state = initial_state.clone()
+    live_output = torch.ops._C_ascend.npu_causal_conv1d_310(
+        live_x,
+        weight,
+        bias=None,
+        conv_states=live_state.transpose(-1, -2),
+        query_start_loc=torch.tensor([0, seq_len], dtype=torch.int32, device=device),
+        cache_indices=torch.tensor([0], dtype=torch.int32, device=device),
+        initial_state_mode=None,
+        num_accepted_tokens=torch.tensor([accepted_tokens], dtype=torch.int32, device=device),
+        activation_mode=1,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=1,
+    )
+
+    padded_state = initial_state.clone()
+    padded_output = torch.ops._C_ascend.npu_causal_conv1d_310(
+        padded_x,
+        weight,
+        bias=None,
+        conv_states=padded_state.transpose(-1, -2),
+        query_start_loc=torch.tensor([0, seq_len, seq_len], dtype=torch.int32, device=device),
+        cache_indices=torch.tensor(
+            [[0] * seq_len, [PAD_SLOT_ID] * seq_len],
+            dtype=torch.int32,
+            device=device,
+        ),
+        initial_state_mode=None,
+        num_accepted_tokens=torch.tensor([accepted_tokens, 0], dtype=torch.int32, device=device),
+        activation_mode=1,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=1,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(padded_output[:seq_len], live_output, atol=0, rtol=0)
+    torch.testing.assert_close(padded_state[0], live_state[0], atol=0, rtol=0)
+    torch.testing.assert_close(
+        padded_state[1],
+        initial_state[1],
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
 @pytest.mark.parametrize("itype", [torch.float16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [False, True])

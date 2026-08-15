@@ -351,6 +351,60 @@ class TestAscendAttentionBackendImpl310(TestBase):
         )
         self.assertIs(metadata.slot_mapping, original_slots)
 
+    def test_dflash_k15_graph_padding_is_excluded_from_cache_write(self):
+        actual_tokens = 16
+        graph_tokens = 32
+        query = torch.randn(graph_tokens, 8, 128)
+        key = torch.randn(graph_tokens, 8, 128)
+        value = torch.randn(graph_tokens, 8, 128)
+        output = torch.empty_like(query)
+        key_cache = torch.zeros(2, 64, 8, 128)
+        value_cache = torch.zeros_like(key_cache)
+        original_slots = torch.arange(graph_tokens, dtype=torch.int32)
+        layer_slots = torch.cat(
+            [
+                torch.arange(actual_tokens, dtype=torch.int32),
+                torch.full(
+                    (graph_tokens - actual_tokens,),
+                    -1,
+                    dtype=torch.int32,
+                ),
+            ]
+        )
+        metadata = MagicMock()
+        metadata.num_actual_tokens = actual_tokens
+        metadata.causal = False
+        metadata.slot_mapping = original_slots
+        self.impl._dflash_query_slot_mapping_310 = layer_slots
+
+        with (
+            patch(
+                "vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache"
+            ) as reshape_and_cache,
+            patch(
+                "vllm_ascend.attention.attention_v1.notify_kv_cache_written"
+            ),
+        ):
+            self.impl.reshape_and_cache(
+                query,
+                key,
+                value,
+                (key_cache, value_cache),
+                metadata,
+                output,
+            )
+
+        reshape_and_cache.assert_called_once()
+        call = reshape_and_cache.call_args.kwargs
+        torch.testing.assert_close(call["key"], key[:actual_tokens])
+        torch.testing.assert_close(call["value"], value[:actual_tokens])
+        torch.testing.assert_close(
+            call["slot_mapping"],
+            layer_slots[:actual_tokens],
+        )
+        assert torch.all(layer_slots[actual_tokens:] == -1)
+        self.assertIs(metadata.slot_mapping, original_slots)
+
     def test_cache_write_without_dflash_override_uses_original_slots(self):
         query = torch.randn(2, 8, 128)
         key = torch.randn(2, 8, 128)
