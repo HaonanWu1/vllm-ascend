@@ -155,6 +155,7 @@ def test_graph_dispatch_diagnostic_records_requested_normalized_and_runtime(
             path="target",
             runtime_mode=CUDAGraphMode.NONE,
             batch_descriptor=_graph_descriptor(),
+            actual_num_tokens=23,
         )
     _reset_dflash_diagnostics_for_test()
 
@@ -166,6 +167,7 @@ def test_graph_dispatch_diagnostic_records_requested_normalized_and_runtime(
         "requested_mode": "FULL",
         "normalized_mode": "FULL_DECODE_ONLY",
         "runtime_mode": "NONE",
+        "actual_num_tokens": 23,
         "capture_descriptor": {
             "num_tokens": 32,
             "num_reqs": 2,
@@ -465,6 +467,87 @@ def test_graph_observer_rejects_changed_positional_input_without_debug_logging(
             assert observe_dflash_acl_graph_call_310(wrapper, graph_input) == "result"
             with pytest.raises(AssertionError, match=r"argument\.0"):
                 observe_dflash_acl_graph_call_310(wrapper, graph_input.clone())
+        finally:
+            _reset_dflash_diagnostics_for_test()
+
+
+def test_piecewise_observer_ignores_metadata_added_after_dummy_capture(
+    tmp_path: Path,
+):
+    """PIECEWISE graphs own their call arguments, not outer metadata."""
+    config = _dflash_graph_config()
+    descriptor = _graph_descriptor()
+    entries = {}
+    wrapper = SimpleNamespace(
+        vllm_config=config,
+        runtime_mode=CUDAGraphMode.PIECEWISE,
+        concrete_aclgraph_entries=entries,
+    )
+    forward_context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        batch_descriptor=descriptor,
+        attn_metadata={},
+        no_compile_layers={},
+    )
+
+    def run_graph(_wrapper, *_args, **_kwargs):
+        entries.setdefault(descriptor, SimpleNamespace(aclgraph=object()))
+        return "result"
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
+                    tmp_path / "piecewise-lifecycle.jsonl"
+                )
+            },
+            clear=False,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.dflash_diagnostics_310."
+            "_original_acl_graph_call_310",
+            side_effect=run_graph,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.dflash_diagnostics_310."
+            "get_forward_context",
+            return_value=forward_context,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.dflash_diagnostics_310."
+            "_is_draft_graph_path",
+            return_value=False,
+        ),
+    ):
+        _reset_dflash_diagnostics_for_test()
+        try:
+            graph_input = torch.zeros(8)
+            keyword_input = torch.ones(8)
+            assert observe_dflash_acl_graph_call_310(
+                wrapper,
+                graph_input,
+                scale=keyword_input,
+            ) == "result"
+            forward_context.attn_metadata = {
+                "model.layers.0.attn": SimpleNamespace(
+                    seq_lens=torch.ones(1, dtype=torch.int32),
+                    query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+                    slot_mapping=torch.zeros(1, dtype=torch.int32),
+                    block_tables=torch.zeros((1, 1), dtype=torch.int32),
+                )
+            }
+            assert observe_dflash_acl_graph_call_310(
+                wrapper,
+                graph_input,
+                scale=keyword_input,
+            ) == "result"
+            with pytest.raises(AssertionError, match=r"keyword\.scale"):
+                observe_dflash_acl_graph_call_310(
+                    wrapper,
+                    graph_input,
+                    scale=keyword_input.clone(),
+                )
         finally:
             _reset_dflash_diagnostics_for_test()
 

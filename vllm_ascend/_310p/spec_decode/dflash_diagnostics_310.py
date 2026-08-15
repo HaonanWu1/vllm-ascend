@@ -183,9 +183,10 @@ def _graph_event_payload(
     batch_descriptor: BatchDescriptor | None,
     capture_occurred: bool,
     replay_occurred: bool,
+    actual_num_tokens: int | None = None,
 ) -> dict[str, Any]:
     requested_mode, normalized_mode = _graph_mode_names(vllm_config)
-    return {
+    payload = {
         "path": path,
         "requested_mode": requested_mode,
         "normalized_mode": normalized_mode,
@@ -194,6 +195,9 @@ def _graph_event_payload(
         "capture_occurred": capture_occurred,
         "replay_occurred": replay_occurred,
     }
+    if actual_num_tokens is not None:
+        payload["actual_num_tokens"] = actual_num_tokens
+    return payload
 
 
 def capture_dflash_graph_dispatch(
@@ -202,6 +206,7 @@ def capture_dflash_graph_dispatch(
     path: str,
     runtime_mode: CUDAGraphMode,
     batch_descriptor: BatchDescriptor | None,
+    actual_num_tokens: int | None = None,
 ) -> None:
     """Record one target/draft dispatch without inspecting data when disabled."""
     capture_dflash_diagnostic(
@@ -213,6 +218,7 @@ def capture_dflash_graph_dispatch(
             batch_descriptor=batch_descriptor,
             capture_occurred=False,
             replay_occurred=False,
+            actual_num_tokens=actual_num_tokens,
         ),
     )
 
@@ -359,6 +365,16 @@ def collect_dflash_graph_tensors_310(
     tensors: dict[str, torch.Tensor] = {}
     for index, value in enumerate(args):
         _add_graph_tensors(tensors, f"argument.{index}", value)
+
+    # A PIECEWISE wrapper captures one compiler-produced region. Its complete
+    # graph contract is carried by the region's explicit call arguments;
+    # forward-context metadata belongs to split-out operations and can be
+    # populated only after dummy capture. FULL wraps the model/proposer call
+    # and must additionally validate the persistent owner/context buffers.
+    if getattr(wrapper, "runtime_mode", None) == CUDAGraphMode.PIECEWISE:
+        for name, value in kwargs.items():
+            _add_graph_tensors(tensors, f"keyword.{name}", value)
+        return tensors
 
     if path == "target":
         _add_graph_tensors(tensors, "input.input_ids", kwargs.get("input_ids"))
