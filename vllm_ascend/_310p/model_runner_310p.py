@@ -208,12 +208,31 @@ class NPUModelRunner310(NPUModelRunner):
         num_encoder_reqs: int = 0,
     ):
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
+        dflash_piecewise = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dflash"
+            and getattr(
+                self,
+                "_dflash_requested_cudagraph_mode_310",
+                CUDAGraphMode.NONE,
+            )
+            == CUDAGraphMode.PIECEWISE
+            and self.cudagraph_dispatcher.cudagraph_mode == CUDAGraphMode.PIECEWISE
+        )
 
-        if self.attn_state in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillCacheHit):
+        if (
+            not dflash_piecewise
+            and self.attn_state
+            in (
+                AscendAttentionState.ChunkedPrefill,
+                AscendAttentionState.PrefillCacheHit,
+            )
+        ):
             force_eager = True
 
-        # Spec decoding graph replay is only valid for uniform spec-decode batches (q_len = 1 + K).
-        if self.speculative_config is not None and (
+        # Full speculative replay is valid only for uniform q_len=1+K batches.
+        # DFlash PIECEWISE keeps dynamic metadata work outside captured regions.
+        if self.speculative_config is not None and not dflash_piecewise and (
             self.attn_state != AscendAttentionState.SpecDecoding
             or max_num_scheduled_tokens != self.uniform_decode_query_len
             or num_tokens != max_num_scheduled_tokens * num_reqs
@@ -253,6 +272,7 @@ class NPUModelRunner310(NPUModelRunner):
                 path="target",
                 runtime_mode=result[0],
                 batch_descriptor=result[1],
+                actual_num_tokens=num_tokens,
             )
         return result
 
@@ -800,12 +820,17 @@ class NPUModelRunner310(NPUModelRunner):
     ) -> None:
         # 910B does not need this branch because runner/dispatcher query_len are
         # naturally consistent there. 310P ngram needs temporary alignment.
-        capture_graph_modes = (
+        is_dflash = (
             self.speculative_config is not None
             and self.speculative_config.method == "dflash"
-            and dflash_diagnostic_enabled()
         )
+        capture_graph_modes = is_dflash and dflash_diagnostic_enabled()
         requested_mode = self.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
+        if is_dflash and not hasattr(
+            self,
+            "_dflash_requested_cudagraph_mode_310",
+        ):
+            self._dflash_requested_cudagraph_mode_310 = requested_mode
         with self.temporary_modify_uniform_decode_query_len():
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
         if capture_graph_modes:

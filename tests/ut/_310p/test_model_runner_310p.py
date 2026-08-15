@@ -31,6 +31,7 @@ from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
     _reset_dflash_diagnostics_for_test,
 )
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 
 _DFLASH_GRAPH_RUNTIME_CONTRACT = {
@@ -84,6 +85,31 @@ def _make_k15_dflash_dispatcher(
     return dispatcher
 
 
+def _make_k15_spec_runner(
+    requested_mode: CUDAGraphMode,
+    method: str = "dflash",
+) -> tuple[NPUModelRunner310, CudagraphDispatcher]:
+    dispatcher = _make_k15_dflash_dispatcher(requested_mode)
+    vllm_config = dispatcher.vllm_config
+    vllm_config.speculative_config = SimpleNamespace(method=method)
+    vllm_config.model_config = SimpleNamespace(is_encoder_decoder=False)
+    vllm_config.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+    )
+    vllm_config.observability_config = SimpleNamespace(cudagraph_metrics=False)
+    vllm_config.additional_config = {}
+
+    runner = object.__new__(NPUModelRunner310)
+    runner.vllm_config = vllm_config
+    runner.speculative_config = vllm_config.speculative_config
+    runner.model_config = vllm_config.model_config
+    runner.cudagraph_dispatcher = dispatcher
+    runner._dflash_requested_cudagraph_mode_310 = requested_mode
+    runner.uniform_decode_query_len = 16
+    return runner, dispatcher
+
+
 @pytest.mark.parametrize("execution_path", ["target", "draft"])
 @pytest.mark.parametrize(
     ("batch_kind", "num_tokens", "uniform_decode"),
@@ -129,6 +155,230 @@ def test_k15_dflash_graph_runtime_contract(
         assert descriptor.num_tokens >= num_tokens
 
 
+@pytest.mark.parametrize(
+    (
+        "batch_kind",
+        "attn_state",
+        "num_scheduled_tokens",
+        "num_computed_tokens",
+    ),
+    [
+        pytest.param(
+            "prefill",
+            AscendAttentionState.ChunkedPrefill,
+            [7],
+            [0],
+            id="prefill",
+        ),
+        pytest.param(
+            "prefill_cache_hit",
+            AscendAttentionState.PrefillCacheHit,
+            [7],
+            [0],
+            id="prefill-cache-hit",
+        ),
+        pytest.param(
+            "mixed",
+            AscendAttentionState.ChunkedPrefill,
+            [7, 16],
+            [0, 32],
+            id="mixed",
+        ),
+        pytest.param(
+            "uniform_decode",
+            AscendAttentionState.SpecDecoding,
+            [16, 16],
+            [32, 48],
+            id="k15-uniform-decode",
+        ),
+    ],
+)
+def test_k15_dflash_piecewise_target_and_draft_dispatch_integration(
+    batch_kind: str,
+    attn_state: AscendAttentionState,
+    num_scheduled_tokens: list[int],
+    num_computed_tokens: list[int],
+) -> None:
+    """Exercise the target owner and the draft's real dispatcher contract."""
+    runner, dispatcher = _make_k15_spec_runner(CUDAGraphMode.PIECEWISE)
+    runner.attn_state = attn_state
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.asarray(num_computed_tokens, dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+
+    scheduled = np.asarray(num_scheduled_tokens, dtype=np.int32)
+    with (
+        patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        target_mode, target_descriptor, *_ = (
+            runner._determine_batch_execution_and_padding(
+                num_tokens=int(scheduled.sum()),
+                num_reqs=len(scheduled),
+                num_scheduled_tokens_np=scheduled,
+                max_num_scheduled_tokens=int(scheduled.max()),
+                use_cascade_attn=False,
+            )
+        )
+
+    # AscendSpecDecodeBaseProposer._propose dispatches its 16-token-per-request
+    # DFlash query through this same dispatcher, using the target descriptor's
+    # uniform bit rather than reusing the target runtime mode.
+    draft_mode, _ = dispatcher.dispatch(
+        num_tokens=16 * len(scheduled),
+        uniform_decode=target_descriptor.uniform,
+        has_lora=False,
+    )
+
+    assert (target_mode, draft_mode) == (
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.PIECEWISE,
+    ), (
+        f"{batch_kind}: target={target_mode.name}, draft={draft_mode.name}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "method", "force_eager"),
+    [
+        pytest.param(
+            CUDAGraphMode.PIECEWISE,
+            "dspark",
+            False,
+            id="other-speculative-method",
+        ),
+        pytest.param(
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            "dflash",
+            False,
+            id="other-graph-mode",
+        ),
+        pytest.param(
+            CUDAGraphMode.PIECEWISE,
+            "dflash",
+            True,
+            id="explicit-force-eager",
+        ),
+    ],
+)
+def test_k15_dflash_piecewise_relaxation_is_narrowly_scoped(
+    requested_mode: CUDAGraphMode,
+    method: str,
+    force_eager: bool,
+) -> None:
+    runner, _ = _make_k15_spec_runner(requested_mode, method)
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.asarray([0], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+    scheduled = np.asarray([7], dtype=np.int32)
+
+    with (
+        patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runtime_mode, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=7,
+            num_reqs=1,
+            num_scheduled_tokens_np=scheduled,
+            max_num_scheduled_tokens=7,
+            use_cascade_attn=False,
+            force_eager=force_eager,
+        )
+
+    assert runtime_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.parametrize(
+    "requested_mode",
+    [
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        CUDAGraphMode.FULL,
+    ],
+)
+def test_k15_dflash_normalized_piecewise_does_not_expand_requested_mode(
+    requested_mode: CUDAGraphMode,
+) -> None:
+    runner, _ = _make_k15_spec_runner(CUDAGraphMode.PIECEWISE)
+    runner._dflash_requested_cudagraph_mode_310 = requested_mode
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.asarray([0], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+    scheduled = np.asarray([7], dtype=np.int32)
+
+    with (
+        patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runtime_mode, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=7,
+            num_reqs=1,
+            num_scheduled_tokens_np=scheduled,
+            max_num_scheduled_tokens=7,
+            use_cascade_attn=False,
+        )
+
+    assert runtime_mode == CUDAGraphMode.NONE
+
+
+def test_k15_dflash_profile_before_mode_normalization_stays_eager() -> None:
+    runner, _ = _make_k15_spec_runner(CUDAGraphMode.PIECEWISE)
+    del runner._dflash_requested_cudagraph_mode_310
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.asarray([0], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+    scheduled = np.asarray([7], dtype=np.int32)
+
+    with (
+        patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p.dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runtime_mode, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=7,
+            num_reqs=1,
+            num_scheduled_tokens_np=scheduled,
+            max_num_scheduled_tokens=7,
+            use_cascade_attn=False,
+        )
+
+    assert runtime_mode == CUDAGraphMode.NONE
+
+
 @pytest.mark.parametrize("diagnostic_enabled", [False, True])
 def test_target_dispatch_emits_path_labelled_dflash_graph_evidence(
     diagnostic_enabled: bool,
@@ -138,6 +388,10 @@ def test_target_dispatch_emits_path_labelled_dflash_graph_evidence(
         speculative_config=SimpleNamespace(method="dflash")
     )
     runner.speculative_config = runner.vllm_config.speculative_config
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.NONE
+    )
+    runner._dflash_requested_cudagraph_mode_310 = CUDAGraphMode.NONE
     runner.input_batch = SimpleNamespace(
         num_computed_tokens_cpu=np.array([3, 5], dtype=np.int32)
     )
@@ -182,6 +436,7 @@ def test_target_dispatch_emits_path_labelled_dflash_graph_evidence(
             path="target",
             runtime_mode=CUDAGraphMode.NONE,
             batch_descriptor=descriptor,
+            actual_num_tokens=23,
         )
     else:
         capture.assert_not_called()
@@ -220,6 +475,8 @@ def test_dflash_graph_mode_normalization_is_remembered(
         ),
     ):
         runner._check_and_update_cudagraph_mode([], [])
+
+    assert runner._dflash_requested_cudagraph_mode_310 == CUDAGraphMode.FULL
 
     if diagnostic_enabled:
         remember.assert_called_once_with(
