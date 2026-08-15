@@ -461,7 +461,8 @@ private:
 #endif
     }
 
-    __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset)
+    __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset,
+                                  bool roundStateForNextToken)
     {
         uint32_t stateShape[2] = {curSingleV, alignK_};
         uint32_t ktShape[2] = {1, alignK_};
@@ -503,6 +504,16 @@ private:
         CastOrCopy(stateOutLocal, stateInUb, AscendC::RoundMode::CAST_RINT, alignK_ * curSingleV);
         CastOrCopy(attnOutLocal, attnInUb, AscendC::RoundMode::CAST_RINT, curSingleV);
 #endif
+        if (roundStateForNextToken) {
+            // Persistent recurrent state uses outType precision. Match
+            // token-by-token decode by feeding the persisted value, rather
+            // than the higher-precision UB accumulator, to the next token in
+            // the same verification window.
+            AscendC::PipeBarrier<PIPE_V>();
+            CastOrCopy(stateInUb, stateOutLocal, AscendC::RoundMode::CAST_NONE,
+                       alignK_ * curSingleV);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         SetFlag<HardEvent::V_MTE3>(evtVMte3_);
     }
 
@@ -585,7 +596,7 @@ private:
                     ((ssmStateIndicesGm_.GetValue(seq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
-                Compute(curSingleV, curQKOffset, curVOffset);
+                Compute(curSingleV, curQKOffset, curVOffset, seq_i + 1 < seq1);
                 CopyOutAttn(attnOffset, curSingleV);
                 CopyOutState(curStateOutOffset, curSingleV);
             }

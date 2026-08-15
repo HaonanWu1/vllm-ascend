@@ -292,6 +292,93 @@ def test_recurrent_repeated_state_writeback():
 
 
 @pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
+@pytest.mark.parametrize("length", (3, 16))
+def test_recurrent_window_matches_persistent_fp16_step_decode(length):
+    """A verification window must observe the persisted state precision.
+
+    Target decode writes the FP16 recurrent state after every token and reloads
+    it for the next call. A multi-token verification call must produce the same
+    outputs and per-token persistent states from the same inputs and initial
+    state instead of retaining extra FP32 precision between tokens.
+    """
+    enable_custom_op()
+    torch.manual_seed(20260815)
+    num_k_heads = 8
+    num_v_heads = 16
+    head_dim = 128
+    dtype = torch.float16
+    scale = head_dim**-0.5
+
+    query = torch.nn.functional.normalize(
+        torch.randn(length, num_k_heads, head_dim), dim=-1
+    ).to(dtype)
+    key = torch.nn.functional.normalize(
+        torch.randn(length, num_k_heads, head_dim), dim=-1
+    ).to(dtype)
+    value = torch.randn(length, num_v_heads, head_dim, dtype=dtype)
+    beta = torch.rand(length, num_v_heads, dtype=dtype)
+    g = -torch.rand(length, num_v_heads, dtype=torch.float32)
+    initial_state = torch.randn(
+        length,
+        num_v_heads,
+        head_dim,
+        head_dim,
+        dtype=dtype,
+    )
+    window_indices = torch.arange(length, dtype=torch.int32)
+    one_accepted = torch.ones(1, dtype=torch.int32)
+
+    window_state = initial_state.npu()
+    window_output = npu_recurrent_gated_delta_rule_310(
+        query.npu(),
+        key.npu(),
+        value.npu(),
+        beta.npu(),
+        window_state,
+        torch.tensor([length], dtype=torch.int32).npu(),
+        window_indices.npu(),
+        g=g.npu(),
+        num_accepted_tokens=one_accepted.npu(),
+        scale=scale,
+    )
+
+    step_state = initial_state.npu()
+    step_outputs = []
+    step_states = []
+    step_index = torch.zeros(1, dtype=torch.int32).npu()
+    step_length = torch.ones(1, dtype=torch.int32).npu()
+    for token_idx in range(length):
+        step_outputs.append(
+            npu_recurrent_gated_delta_rule_310(
+                query[token_idx : token_idx + 1].npu(),
+                key[token_idx : token_idx + 1].npu(),
+                value[token_idx : token_idx + 1].npu(),
+                beta[token_idx : token_idx + 1].npu(),
+                step_state,
+                step_length,
+                step_index,
+                g=g[token_idx : token_idx + 1].npu(),
+                num_accepted_tokens=one_accepted.npu(),
+                scale=scale,
+            )
+        )
+        step_states.append(step_state[0].clone())
+
+    torch.testing.assert_close(
+        window_output.cpu(),
+        torch.cat(step_outputs).cpu(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        window_state[:length].cpu(),
+        torch.stack(step_states).cpu(),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not is_310p_hw(), reason="Tested separately on a 310P machine.")
 @pytest.mark.parametrize("length", range(1, 17))
 def test_recurrent_verification_window_lengths(length):
     run_recurrent_case(
