@@ -912,9 +912,60 @@ def test_draft_wrapper_captures_returned_tokens_only_for_dflash():
     torch.testing.assert_close(payload["token_indices_to_sample"], token_indices)
 
 
+def test_draft_wrapper_skips_returned_tokens_during_spec_dummy_capture():
+    proposer = object.__new__(AscendSpecDecodeBaseProposer310)
+    proposer.method = "dflash"
+    proposer.vllm_config = _dflash_graph_config()
+    proposer.runner = SimpleNamespace(_spec_dummy_capture=True)
+    result = torch.tensor([[11, 12, 13]], dtype=torch.int32)
+
+    with (
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "_original_run_merged_draft",
+            return_value=result,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "dflash_diagnostic_enabled",
+            return_value=True,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "capture_dflash_diagnostic"
+        ) as capture,
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+            "capture_current_dflash_graph_dispatch"
+        ) as capture_graph_dispatch,
+    ):
+        actual = proposer._run_merged_draft(
+            4,
+            1,
+            torch.tensor([3]),
+            torch.arange(4),
+            None,
+            [SimpleNamespace()],
+            4,
+        )
+
+    torch.testing.assert_close(actual, result)
+    capture_graph_dispatch.assert_called_once_with(
+        proposer.vllm_config,
+        path="draft",
+    )
+    capture.assert_not_called()
+
+
 def test_draft_wrapper_does_not_capture_for_dspark():
+    class UnexpectedMarkerRead:
+        @property
+        def _spec_dummy_capture(self):
+            raise AssertionError("DSpark must not inspect DFlash capture state")
+
     proposer = object.__new__(AscendSpecDecodeBaseProposer310)
     proposer.method = "dspark"
+    proposer.runner = UnexpectedMarkerRead()
     result = torch.tensor([[11, 12, 13]], dtype=torch.int32)
 
     with (

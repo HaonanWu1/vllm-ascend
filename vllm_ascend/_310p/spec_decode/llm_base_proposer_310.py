@@ -78,7 +78,14 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
                 )
         finally:
             AscendRotaryEmbedding310.set_rope_position_flag_310p(False)
-        if capture_diagnostics:
+        in_spec_dummy_capture = capture_diagnostics and bool(
+            getattr(
+                getattr(self, "runner", None),
+                "_spec_dummy_capture",
+                False,
+            )
+        )
+        if capture_diagnostics and not in_spec_dummy_capture:
             capture_dflash_diagnostic(
                 "draft_output",
                 payload_builder=lambda: {
