@@ -16,9 +16,11 @@
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.config import CUDAGraphMode
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.attention.attention_v1 import (
+    AttentionMaskBuilder310,
     AscendAttentionBackend310,
     AscendAttentionBackendImpl310,
     AscendAttentionMetadataBuilder310,
@@ -26,6 +28,7 @@ from vllm_ascend._310p.attention.attention_v1 import (
 )
 from vllm_ascend._310p.attention.metadata_builder import (
     AscendAttentionMetadataBuilder310 as AscendMetadataBuilder310Direct,
+    set_query_lens_cpu,
 )
 
 
@@ -260,6 +263,93 @@ class TestAscendAttentionBackendImpl310(TestBase):
             self.impl.forward_impl(query, None, None, None, metadata, output)
             mock_non_causal_mask.assert_called_once()
             mock_npu_paged_attention_splitfuse.assert_called_once()
+
+    @patch("torch_npu._npu_paged_attention_splitfuse")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_full_uniform_target_and_draft_use_graph_safe_mask_positions(
+        self,
+        mock_get_forward_context,
+        mock_npu_paged_attention_splitfuse,
+    ):
+        query = torch.randn(32, 8, 64)
+        output = torch.empty_like(query)
+        metadata = self.attn_metadata
+        metadata.max_query_len = 16
+        metadata.seq_lens = torch.tensor([20, 0], dtype=torch.int32)
+        metadata.query_start_loc = torch.tensor([0, 16, 32], dtype=torch.int32)
+        metadata.block_tables = torch.zeros(2, 5, dtype=torch.long)
+        metadata.num_actual_tokens = 32
+        metadata.slot_mapping = torch.zeros(32, dtype=torch.long)
+        set_query_lens_cpu(
+            metadata,
+            torch.tensor([16, 16], dtype=torch.int32),
+        )
+
+        self.impl.support_compressed_mask = False
+        graph_mask = torch.zeros(2, 128, 16, 16)
+        mock_get_forward_context.return_value.cudagraph_runtime_mode = (
+            CUDAGraphMode.FULL
+        )
+        cases = (
+            (
+                AscendAttentionState.SpecDecoding,
+                True,
+                "get_splitfuse_mask",
+            ),
+            (
+                AscendAttentionState.ChunkedPrefill,
+                False,
+                "get_non_causal_splitfuse_mask",
+            ),
+        )
+        for attn_state, causal, method_name in cases:
+            with self.subTest(attn_state=attn_state, causal=causal):
+                metadata.attn_state = attn_state
+                metadata.causal = causal
+                with patch.object(
+                    AttentionMaskBuilder310,
+                    method_name,
+                    return_value=graph_mask,
+                ) as build_mask:
+                    self.impl.forward_impl(
+                        query,
+                        None,
+                        None,
+                        None,
+                        metadata,
+                        output,
+                    )
+                    build_mask.assert_called_once_with(
+                        metadata,
+                        query.device,
+                        graph_safe_uniform=True,
+                    )
+
+        mock_get_forward_context.return_value.cudagraph_runtime_mode = (
+            CUDAGraphMode.PIECEWISE
+        )
+        metadata.attn_state = AscendAttentionState.SpecDecoding
+        metadata.causal = True
+        with patch.object(
+            AttentionMaskBuilder310,
+            "get_splitfuse_mask",
+            return_value=graph_mask,
+        ) as build_mask:
+            self.impl.forward_impl(
+                query,
+                None,
+                None,
+                None,
+                metadata,
+                output,
+            )
+            build_mask.assert_called_once_with(
+                metadata,
+                query.device,
+                graph_safe_uniform=False,
+            )
+
+        self.assertEqual(mock_npu_paged_attention_splitfuse.call_count, 3)
 
     @patch(
         "torch_npu.npu_format_cast",

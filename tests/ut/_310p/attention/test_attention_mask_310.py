@@ -53,6 +53,48 @@ class TestAttentionMaskBuilder310(TestBase):
         attn_mask = AttentionMaskBuilder310.get_non_causal_splitfuse_mask(attn_metadata, torch.device("cpu"))
         self.assertEqual(attn_mask.shape, (1, self.max_seqlen // 16, 16, 16))
 
+    def test_uniform_k15_query_positions_stay_on_device_and_clamp_padding(self):
+        attn_metadata = MagicMock()
+        attn_metadata.max_query_len = 16
+        attn_metadata.num_actual_tokens = 32
+        attn_metadata.seq_lens = torch.tensor([20, 0], dtype=torch.int32)
+
+        causal = AttentionMaskBuilder310.get_uniform_query_positions(
+            attn_metadata,
+            torch.device("cpu"),
+            causal=True,
+        )
+        non_causal = AttentionMaskBuilder310.get_uniform_query_positions(
+            attn_metadata,
+            torch.device("cpu"),
+            causal=False,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                causal,
+                torch.tensor(
+                    list(range(4, 20)) + [0] * 16,
+                    dtype=torch.int64,
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                non_causal,
+                torch.tensor([19] * 16 + [0] * 16, dtype=torch.int64),
+            )
+        )
+        # A non-uniform descriptor must not silently use the fixed-query path.
+        attn_metadata.num_actual_tokens = 31
+        self.assertIsNone(
+            AttentionMaskBuilder310.get_uniform_query_positions(
+                attn_metadata,
+                torch.device("cpu"),
+                causal=True,
+            )
+        )
+
     def test_get_compressed_non_causal_splitfuse_mask_310(self):
         from vllm_ascend._310p.attention.attention_mask import COMPRESSED_MASK_SEQ_LEN
 

@@ -70,8 +70,53 @@ class AttentionMaskBuilder310:
         mask.masked_fill_(upper, float("-inf"))
         return mask
 
+    @staticmethod
+    def get_uniform_query_positions(
+        attn_metadata: AscendMetadata,
+        device: torch.device,
+        causal: bool,
+    ) -> torch.Tensor | None:
+        """Build fixed-query splitfuse rows without a device-to-host copy."""
+        query_len = attn_metadata.max_query_len
+        if not query_len:
+            return None
+
+        num_query_tokens = int(attn_metadata.num_actual_tokens)
+        num_reqs = attn_metadata.seq_lens.shape[0]
+        if num_query_tokens != num_reqs * query_len:
+            return None
+
+        token_indices = torch.arange(
+            num_query_tokens,
+            dtype=torch.int64,
+            device=device,
+        )
+        request_indices = torch.div(
+            token_indices,
+            query_len,
+            rounding_mode="floor",
+        )
+        context_lens = attn_metadata.seq_lens.index_select(
+            0,
+            request_indices,
+        )
+        if causal:
+            positions = (
+                context_lens
+                - query_len
+                + torch.remainder(token_indices, query_len)
+            )
+        else:
+            positions = context_lens - 1
+        return positions.clamp_min_(0)
+
     @classmethod
-    def get_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device):
+    def get_splitfuse_mask(
+        cls,
+        attn_metadata: AscendMetadata,
+        device: torch.device,
+        graph_safe_uniform: bool = False,
+    ):
         """
         Generates and formats the attention mask for SplitFuse (chunked prefill) decoding.
 
@@ -88,19 +133,41 @@ class AttentionMaskBuilder310:
         """
         if cls.chunked_prefill_attn_mask is None:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
-        qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
-        qlens = qsl[1:] - qsl[:-1]
-        q_list = qlens.tolist()
-        context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
-        c_list = context_lens.tolist()
-        pos_list = [p for ql, cl in zip(q_list, c_list) for p in range(cl - ql, cl)]
-        position = torch.tensor(pos_list, dtype=torch.int32, device=device)
+        position = None
+        if graph_safe_uniform:
+            position = cls.get_uniform_query_positions(
+                attn_metadata,
+                device,
+                causal=True,
+            )
+            if position is None:
+                raise RuntimeError(
+                    "310P FULL speculative capture requires a uniform "
+                    "fixed-query splitfuse descriptor"
+                )
+        if position is None:
+            qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
+            qlens = qsl[1:] - qsl[:-1]
+            q_list = qlens.tolist()
+            context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
+            c_list = context_lens.tolist()
+            pos_list = [
+                position
+                for query_len, context_len in zip(q_list, c_list)
+                for position in range(context_len - query_len, context_len)
+            ]
+            position = torch.tensor(pos_list, dtype=torch.int32, device=device)
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
         splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
         return splitfuse_mask_nz
 
     @classmethod
-    def get_non_causal_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device):
+    def get_non_causal_splitfuse_mask(
+        cls,
+        attn_metadata: AscendMetadata,
+        device: torch.device,
+        graph_safe_uniform: bool = False,
+    ):
         """SplitFuse mask for full / non-causal attention (dflash/dspark draft).
 
         Every query token must attend to the entire valid sequence ``[0, cl)``
@@ -117,14 +184,31 @@ class AttentionMaskBuilder310:
         """
         if cls.chunked_prefill_attn_mask is None:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
-        qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
-        qlens = qsl[1:] - qsl[:-1]
-        q_list = qlens.tolist()
-        context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
-        c_list = context_lens.tolist()
-        # Non-causal: all query tokens of a request share the last valid row (cl-1).
-        pos_list = [cl - 1 for ql, cl in zip(q_list, c_list) for _ in range(ql)]
-        position = torch.tensor(pos_list, dtype=torch.int32, device=device)
+        position = None
+        if graph_safe_uniform:
+            position = cls.get_uniform_query_positions(
+                attn_metadata,
+                device,
+                causal=False,
+            )
+            if position is None:
+                raise RuntimeError(
+                    "310P FULL speculative capture requires a uniform "
+                    "fixed-query splitfuse descriptor"
+                )
+        if position is None:
+            qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
+            qlens = qsl[1:] - qsl[:-1]
+            q_list = qlens.tolist()
+            context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
+            c_list = context_lens.tolist()
+            # Non-causal query tokens share the last valid row for a request.
+            pos_list = [
+                context_len - 1
+                for query_len, context_len in zip(q_list, c_list)
+                for _ in range(query_len)
+            ]
+            position = torch.tensor(pos_list, dtype=torch.int32, device=device)
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
         splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
         return splitfuse_mask_nz

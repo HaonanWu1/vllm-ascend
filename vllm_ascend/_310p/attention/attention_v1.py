@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
     register_backend,
@@ -348,10 +349,24 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             return output
 
         # Generate the specific mask for splitfuse
+        from vllm_ascend.ascend_forward_context import get_forward_context
+
+        graph_safe_uniform = (
+            get_forward_context().cudagraph_runtime_mode
+            == CUDAGraphMode.FULL
+        )
         if attn_metadata.causal:
-            mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
+            mask = AttentionMaskBuilder310.get_splitfuse_mask(
+                attn_metadata,
+                query.device,
+                graph_safe_uniform=graph_safe_uniform,
+            )
         else:
-            mask = AttentionMaskBuilder310.get_non_causal_splitfuse_mask(attn_metadata, query.device)
+            mask = AttentionMaskBuilder310.get_non_causal_splitfuse_mask(
+                attn_metadata,
+                query.device,
+                graph_safe_uniform=graph_safe_uniform,
+            )
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
             key_cache=self.key_cache,
