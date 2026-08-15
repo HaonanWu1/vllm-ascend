@@ -22,6 +22,14 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _get_non_negative_int_env(name: str, default: int) -> int:
+    try:
+        return max(int(os.getenv(name, str(default))), 0)
+    except ValueError:
+        return default
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -104,6 +112,23 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Output path for opt-in 310P DFlash diagnostics. The default empty path
+    # disables diagnostics. This path is not a credential or other secret.
+    "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": lambda: os.getenv(
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH", ""
+    ),
+    # Maximum diagnostic records per stage. Valid values are non-negative
+    # integers; 0 disables diagnostics, and invalid values use the default 4.
+    # This value is not sensitive.
+    "VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT": lambda: _get_non_negative_int_env(
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT", 4
+    ),
+    # Maximum tensor elements serialized in each diagnostic field. Valid
+    # values are non-negative integers; invalid values use the default 4096.
+    # This value is not sensitive.
+    "VLLM_ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS": lambda: _get_non_negative_int_env(
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS", 4096
+    ),
 }
 
 # end-env-vars-definition

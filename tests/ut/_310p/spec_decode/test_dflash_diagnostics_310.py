@@ -12,6 +12,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
     _reset_dflash_diagnostics_for_test,
     assert_dflash_graph_tensor_addresses_310,
@@ -38,11 +39,44 @@ def test_disabled_diagnostics_do_not_inspect_or_write(tmp_path: Path):
     assert not output.exists()
 
 
+def test_dflash_diagnostic_envs_are_registered_with_safe_defaults():
+    names = {
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH",
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT",
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS",
+    }
+
+    assert names <= ascend_envs.env_variables.keys()
+    with patch.dict(os.environ, {}, clear=True):
+        assert ascend_envs.VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH == ""
+        assert ascend_envs.VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT == 4
+        assert ascend_envs.VLLM_ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS == 4096
+
+
+@pytest.mark.parametrize(
+    ("name", "default"),
+    [
+        ("VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT", 4),
+        ("VLLM_ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS", 4096),
+    ],
+)
+def test_dflash_diagnostic_integer_envs_clamp_zero_and_reject_invalid(
+    name: str,
+    default: int,
+):
+    with patch.dict(os.environ, {name: "0"}, clear=False):
+        assert getattr(ascend_envs, name) == 0
+    with patch.dict(os.environ, {name: "-1"}, clear=False):
+        assert getattr(ascend_envs, name) == 0
+    with patch.dict(os.environ, {name: "invalid"}, clear=False):
+        assert getattr(ascend_envs, name) == default
+
+
 def test_enabled_diagnostics_are_bounded_per_stage(tmp_path: Path):
     output = tmp_path / "capture.jsonl"
     env = {
-        "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
-        "ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "2",
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "2",
     }
     with patch.dict(os.environ, env, clear=False):
         _reset_dflash_diagnostics_for_test()
@@ -73,7 +107,7 @@ def test_enabled_diagnostics_are_bounded_per_stage(tmp_path: Path):
 
 def test_payload_builder_failure_is_swallowed(tmp_path: Path):
     output = tmp_path / "failed.jsonl"
-    env = {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)}
+    env = {"VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)}
     builder = MagicMock(side_effect=RuntimeError("diagnostic-only failure"))
     with (
         patch.dict(os.environ, env, clear=False),
@@ -93,8 +127,8 @@ def test_payload_builder_failure_is_swallowed(tmp_path: Path):
 def test_empty_payload_does_not_consume_stage_quota(tmp_path: Path):
     output = tmp_path / "capture.jsonl"
     env = {
-        "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
-        "ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "1",
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "1",
     }
     with patch.dict(os.environ, env, clear=False):
         _reset_dflash_diagnostics_for_test()
@@ -141,7 +175,7 @@ def test_graph_dispatch_diagnostic_records_requested_normalized_and_runtime(
     config = _dflash_graph_config()
     with patch.dict(
         os.environ,
-        {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
+        {"VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
         clear=False,
     ):
         _reset_dflash_diagnostics_for_test()
@@ -185,7 +219,7 @@ def test_graph_mode_refresh_preserves_the_original_request(tmp_path: Path):
     config = _dflash_graph_config()
     with patch.dict(
         os.environ,
-        {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
+        {"VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
         clear=False,
     ):
         _reset_dflash_diagnostics_for_test()
@@ -226,7 +260,7 @@ def test_graph_mode_marker_preserves_request_for_draft_config(
 
     with patch.dict(
         os.environ,
-        {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
+        {"VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
         clear=False,
     ):
         _reset_dflash_diagnostics_for_test()
@@ -277,7 +311,7 @@ def test_acl_graph_observer_records_path_and_actual_occurrence(
     with (
         patch.dict(
             os.environ,
-            {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
+            {"VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
             clear=False,
         ),
         patch(
@@ -366,7 +400,11 @@ def test_enabled_graph_observer_bypasses_dspark_before_context_read(
     with (
         patch.dict(
             os.environ,
-            {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(tmp_path / "dspark.jsonl")},
+            {
+                "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
+                    tmp_path / "dspark.jsonl"
+                )
+            },
             clear=False,
         ),
         patch(
@@ -410,7 +448,11 @@ def test_graph_replay_asserts_all_persistent_dflash_tensor_addresses(
     }
     with patch.dict(
         os.environ,
-        {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(tmp_path / "graph.jsonl")},
+        {
+            "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
+                tmp_path / "graph.jsonl"
+            )
+        },
         clear=False,
     ):
         _reset_dflash_diagnostics_for_test()
@@ -471,7 +513,9 @@ def test_graph_observer_rejects_changed_positional_input_without_debug_logging(
         patch.dict(
             os.environ,
             {
-                "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(tmp_path / "args.jsonl"),
+                "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
+                    tmp_path / "args.jsonl"
+                ),
                 "VLLM_LOGGING_LEVEL": "INFO",
             },
             clear=False,
@@ -529,7 +573,7 @@ def test_piecewise_observer_ignores_metadata_added_after_dummy_capture(
         patch.dict(
             os.environ,
             {
-                "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
+                "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
                     tmp_path / "piecewise-lifecycle.jsonl"
                 )
             },
@@ -646,7 +690,7 @@ def test_graph_observer_rejects_changed_draft_persistent_input(
         patch.dict(
             os.environ,
             {
-                "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
+                "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(
                     tmp_path / "draft-slot.jsonl"
                 )
             },
@@ -728,9 +772,9 @@ def test_draft_full_graph_observer_captures_fixed_capacity_indices_before_replay
         patch.dict(
             os.environ,
             {
-                "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
-                "ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "4",
-                "ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS": "16",
+                "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
+                "VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "4",
+                "VLLM_ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS": "16",
             },
             clear=False,
         ),
@@ -1146,7 +1190,7 @@ def test_draft_wrapper_diagnostic_introspection_failure_preserves_inference(
     with (
         patch.dict(
             os.environ,
-            {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
+            {"VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output)},
             clear=False,
         ),
         patch(
@@ -1203,8 +1247,8 @@ def test_draft_wrapper_does_not_inspect_embedding_after_stage_quota(
     result = torch.tensor([[31, 32, 33]], dtype=torch.int32)
     output = tmp_path / "bounded-introspection.jsonl"
     env = {
-        "ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
-        "ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "1",
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(output),
+        "VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT": "1",
     }
 
     with (

@@ -15,14 +15,9 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
-
-_PATH_ENV = "ASCEND_DFLASH_DIAGNOSTIC_PATH"
-_LIMIT_ENV = "ASCEND_DFLASH_DIAGNOSTIC_LIMIT"
-_MAX_ELEMENTS_ENV = "ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS"
-_DEFAULT_LIMIT = 4
-_DEFAULT_MAX_ELEMENTS = 4096
 
 _lock = threading.Lock()
 _config: tuple[Path | None, int, int] | None = None
@@ -35,21 +30,14 @@ _graph_tensor_addresses: dict[
 _original_acl_graph_call_310 = ACLGraphWrapper.__call__
 
 
-def _positive_int_env(name: str, default: int) -> int:
-    try:
-        return max(int(os.getenv(name, str(default))), 0)
-    except ValueError:
-        return default
-
-
 def _get_config() -> tuple[Path | None, int, int]:
     global _config
     if _config is None:
-        raw_path = os.getenv(_PATH_ENV, "").strip()
+        raw_path = envs.VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH.strip()
         _config = (
             Path(raw_path) if raw_path else None,
-            _positive_int_env(_LIMIT_ENV, _DEFAULT_LIMIT),
-            _positive_int_env(_MAX_ELEMENTS_ENV, _DEFAULT_MAX_ELEMENTS),
+            envs.VLLM_ASCEND_DFLASH_DIAGNOSTIC_LIMIT,
+            envs.VLLM_ASCEND_DFLASH_DIAGNOSTIC_MAX_ELEMENTS,
         )
     return _config
 

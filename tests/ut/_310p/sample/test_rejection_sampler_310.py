@@ -138,7 +138,7 @@ class TestForcePytorchRejectionPath(TestBase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "capture.jsonl"
-            env = {"ASCEND_DFLASH_DIAGNOSTIC_PATH": str(path)}
+            env = {"VLLM_ASCEND_DFLASH_DIAGNOSTIC_PATH": str(path)}
             with (
                 patch.dict(os.environ, env, clear=False),
                 patch.object(
