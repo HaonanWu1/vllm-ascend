@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -128,6 +130,25 @@ def set_mrope_apply_rotary_slices(
 _draft_cos: torch.Tensor | None = None
 _draft_sin: torch.Tensor | None = None
 _draft_rope_dim: int | None = None
+_draft_min_capacity_tokens = 0
+
+
+@contextmanager
+def reserve_draft_rope_capacity_310p(capacity_tokens: int) -> Iterator[None]:
+    """Keep one draft RoPE allocation large enough for a DFlash call.
+
+    DFlash uses the same draft-local cos/sin storage for context-KV
+    precomputation and query execution. Reserving the proposer's maximum legal
+    context length before either path runs prevents a longer context from
+    reallocating a buffer already captured by a PIECEWISE query graph.
+    """
+    global _draft_min_capacity_tokens
+    previous_capacity = _draft_min_capacity_tokens
+    _draft_min_capacity_tokens = max(previous_capacity, capacity_tokens)
+    try:
+        yield
+    finally:
+        _draft_min_capacity_tokens = previous_capacity
 
 
 def _build_draft_cos_sin_slice(
@@ -145,14 +166,18 @@ def _build_draft_cos_sin_slice(
     global _draft_cos, _draft_sin, _draft_rope_dim
     num_tokens = positions.size(0)
     rope_dim = cos_sin_cache.shape[-1]
+    required_capacity = max(num_tokens, _draft_min_capacity_tokens)
     if (
         _draft_cos is None
         or _draft_rope_dim != rope_dim
-        or _draft_cos.shape[1] < num_tokens
+        or _draft_cos.shape[1] < required_capacity
         or _draft_cos.device != cos_sin_cache.device
         or _draft_cos.dtype != cos_sin_cache.dtype
     ):
-        capacity = max(num_tokens, 0 if _draft_cos is None else _draft_cos.shape[1])
+        capacity = max(
+            required_capacity,
+            0 if _draft_cos is None else _draft_cos.shape[1],
+        )
         _draft_cos = torch.ones(
             1, capacity, 1, rope_dim, dtype=cos_sin_cache.dtype, device=cos_sin_cache.device
         )

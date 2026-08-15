@@ -15,12 +15,16 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+from vllm_ascend._310p.ops.rotary_embedding import (
+    AscendRotaryEmbedding310,
+    reserve_draft_rope_capacity_310p,
+)
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
     capture_current_dflash_graph_dispatch,
     capture_dflash_diagnostic,
@@ -52,18 +56,26 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
                 self.vllm_config,
                 path="draft",
             )
-        try:
-            result = _original_run_merged_draft(
-                self,
-                num_input_tokens,
-                batch_size,
-                token_indices_to_sample,
-                target_positions,
-                inputs_embeds,
-                multi_steps_attn_metadata,
-                num_tokens,
-                is_prefill,
+        rope_capacity = (
+            reserve_draft_rope_capacity_310p(
+                getattr(self, "max_num_tokens", 0)
             )
+            if self.method == "dflash"
+            else nullcontext()
+        )
+        try:
+            with rope_capacity:
+                result = _original_run_merged_draft(
+                    self,
+                    num_input_tokens,
+                    batch_size,
+                    token_indices_to_sample,
+                    target_positions,
+                    inputs_embeds,
+                    multi_steps_attn_metadata,
+                    num_tokens,
+                    is_prefill,
+                )
         finally:
             AscendRotaryEmbedding310.set_rope_position_flag_310p(False)
         if capture_diagnostics:

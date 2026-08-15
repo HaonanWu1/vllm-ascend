@@ -26,13 +26,17 @@ stay free of any 310P coupling.
 """
 
 import functools
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+from vllm_ascend._310p.ops.rotary_embedding import (
+    AscendRotaryEmbedding310,
+    reserve_draft_rope_capacity_310p,
+)
 from vllm_ascend._310p.spec_decode.dflash_diagnostics_310 import (
     capture_dflash_diagnostic,
     dflash_diagnostic_enabled,
@@ -238,8 +242,16 @@ def wrap_dummy_run_with_draft_flag(original):
     def dummy_run(self, *args, **kwargs):
         prev_flag = AscendRotaryEmbedding310._is_drafting_update_enabled
         AscendRotaryEmbedding310.set_rope_position_flag_310p(True)
+        rope_capacity = (
+            reserve_draft_rope_capacity_310p(
+                getattr(self, "max_num_tokens", 0)
+            )
+            if getattr(self, "method", None) == "dflash"
+            else nullcontext()
+        )
         try:
-            return original(self, *args, **kwargs)
+            with rope_capacity:
+                return original(self, *args, **kwargs)
         finally:
             AscendRotaryEmbedding310.set_rope_position_flag_310p(prev_flag)
 

@@ -13,17 +13,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from tests.ut.base import TestBase
-from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+from vllm_ascend._310p.ops import rotary_embedding as rotary_310
+from vllm_ascend._310p.ops.rotary_embedding import (
+    AscendRotaryEmbedding310,
+    _build_draft_cos_sin_slice,
+)
 from vllm_ascend._310p.spec_decode.llm_base_proposer_310 import AscendSpecDecodeBaseProposer310
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 
 
 class TestAscendSpecDecodeBaseProposer310(TestBase):
+    @staticmethod
+    def _reset_draft_rope_buffers():
+        rotary_310._draft_cos = None
+        rotary_310._draft_sin = None
+        rotary_310._draft_rope_dim = None
+
+    @staticmethod
+    def _draft_rope_growth_addresses() -> list[int]:
+        cos_sin_cache = torch.randn(256, 128, dtype=torch.float32)
+        return [
+            _build_draft_cos_sin_slice(
+                cos_sin_cache,
+                torch.arange(num_tokens, dtype=torch.long),
+            )[0].data_ptr()
+            for num_tokens in (128, 141, 128)
+        ]
+
+    @staticmethod
+    def _seed_draft_rope_buffer(num_tokens: int = 128) -> None:
+        _build_draft_cos_sin_slice(
+            torch.randn(256, 128, dtype=torch.float32),
+            torch.arange(num_tokens, dtype=torch.long),
+        )
+
     def test_run_merged_draft_sets_rope_flag_before_call(self):
         flag_states = []
 
@@ -72,6 +101,7 @@ class TestAscendSpecDecodeBaseProposer310(TestBase):
             patch("vllm_ascend._310p.spec_decode.llm_base_proposer_310._original_run_merged_draft", mock_original),
         ):
             proposer = object.__new__(AscendSpecDecodeBaseProposer310)
+            proposer.method = "mtp"
             with self.assertRaises(RuntimeError):
                 proposer._run_merged_draft(
                     num_input_tokens=4,
@@ -84,6 +114,45 @@ class TestAscendSpecDecodeBaseProposer310(TestBase):
                 )
 
         self.assertFalse(AscendRotaryEmbedding310._is_drafting_update_enabled)
+
+    def test_run_merged_dflash_reserves_context_rope_capacity(self):
+        addresses = []
+
+        def mock_original(*args, **kwargs):
+            addresses.extend(self._draft_rope_growth_addresses())
+            return torch.zeros(128, dtype=torch.long)
+
+        proposer = object.__new__(AscendSpecDecodeBaseProposer310)
+        proposer.method = "dflash"
+        proposer.max_num_tokens = 256
+        self._reset_draft_rope_buffers()
+        try:
+            self._seed_draft_rope_buffer()
+            with (
+                patch(
+                    "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+                    "_original_run_merged_draft",
+                    side_effect=mock_original,
+                ),
+                patch(
+                    "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
+                    "dflash_diagnostic_enabled",
+                    return_value=False,
+                ),
+            ):
+                proposer._run_merged_draft(
+                    num_input_tokens=141,
+                    batch_size=8,
+                    token_indices_to_sample=torch.arange(120),
+                    target_positions=torch.arange(128),
+                    inputs_embeds=None,
+                    multi_steps_attn_metadata=None,
+                    num_tokens=128,
+                )
+
+            self.assertEqual(len(set(addresses)), 1)
+        finally:
+            self._reset_draft_rope_buffers()
 
     def test_dummy_run_wrapper_enables_and_restores_flag(self):
         from vllm_ascend._310p.spec_decode.dflash_proposer_310 import wrap_dummy_run_with_draft_flag
@@ -116,3 +185,53 @@ class TestAscendSpecDecodeBaseProposer310(TestBase):
             wrapped(object())
 
         self.assertFalse(AscendRotaryEmbedding310._is_drafting_update_enabled)
+
+    def test_dflash_dummy_run_reserves_context_rope_capacity(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+            wrap_dummy_run_with_draft_flag,
+        )
+
+        addresses = []
+
+        def original(self, *args, **kwargs):
+            addresses.extend(
+                TestAscendSpecDecodeBaseProposer310._draft_rope_growth_addresses()
+            )
+            return "ok"
+
+        proposer = SimpleNamespace(method="dflash", max_num_tokens=256)
+        self._reset_draft_rope_buffers()
+        try:
+            self._seed_draft_rope_buffer()
+            self.assertEqual(
+                wrap_dummy_run_with_draft_flag(original)(proposer),
+                "ok",
+            )
+            self.assertEqual(len(set(addresses)), 1)
+        finally:
+            self._reset_draft_rope_buffers()
+
+    def test_dspark_dummy_run_does_not_reserve_dflash_rope_capacity(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+            wrap_dummy_run_with_draft_flag,
+        )
+
+        addresses = []
+
+        def original(self, *args, **kwargs):
+            addresses.extend(
+                TestAscendSpecDecodeBaseProposer310._draft_rope_growth_addresses()
+            )
+            return "ok"
+
+        proposer = SimpleNamespace(method="dspark", max_num_tokens=256)
+        self._reset_draft_rope_buffers()
+        try:
+            self.assertEqual(
+                wrap_dummy_run_with_draft_flag(original)(proposer),
+                "ok",
+            )
+            self.assertNotEqual(addresses[0], addresses[1])
+            self.assertEqual(addresses[1], addresses[2])
+        finally:
+            self._reset_draft_rope_buffers()
