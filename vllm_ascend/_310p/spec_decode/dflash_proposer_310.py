@@ -30,6 +30,7 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
@@ -225,6 +226,95 @@ def _ensure_kernel_block_size_matches_cache_310(proposer: Any) -> None:
         logger.warning("dflash draft kernel_block_size alignment skipped: %s", exc)
 
 
+def _prepare_dflash_full_graph_capture_310(
+    proposer: Any,
+    num_context: int,
+    num_reqs: int,
+    metadata_builders: list[Any] | None = None,
+) -> None:
+    """Bind a FULL dummy run to the buffers used by 310P DFlash replay."""
+    if metadata_builders is None:
+        metadata_builders = [
+            attn_group.get_metadata_builder()
+            for attn_group in proposer.draft_attn_groups
+        ]
+
+    _ensure_kernel_block_size_matches_cache_310(proposer)
+
+    layer_block_sizes = getattr(
+        proposer,
+        "_dflash_layer_block_sizes_310",
+        {},
+    )
+    layer_names = list(getattr(proposer, "attn_layer_names", []))
+    if any(layer_name not in layer_block_sizes for layer_name in layer_names):
+        raise RuntimeError(
+            "310P DFlash cannot prepare FULL capture without every draft "
+            "layer cache layout."
+        )
+
+    block_sizes = [int(proposer.kernel_block_size)]
+    for layer_name in layer_names:
+        block_size = int(layer_block_sizes[layer_name])
+        if block_size not in block_sizes:
+            block_sizes.append(block_size)
+
+    source_table = proposer.runner.input_batch.block_table[
+        proposer.kv_cache_gid
+    ].get_device_tensor()[:num_reqs]
+    context_buffers, query_buffers = _get_dflash_slot_buffers_by_size_310(
+        proposer,
+        block_sizes,
+    )
+    block_tables = _get_dflash_block_tables_by_size_310(
+        proposer,
+        source_table,
+        block_sizes,
+    )
+
+    num_query_total = num_reqs * (1 + proposer.num_speculative_tokens)
+    primary_context = proposer._context_slot_mapping_buffer[:num_context]
+    primary_query = proposer._slot_mapping_buffer[:num_query_total]
+    for block_size in block_sizes:
+        context = context_buffers[block_size][:num_context]
+        query = query_buffers[block_size][:num_query_total]
+        if context.data_ptr() != primary_context.data_ptr():
+            context.copy_(primary_context)
+        if query.data_ptr() != primary_query.data_ptr():
+            query.copy_(primary_query)
+
+    proposer._dflash_context_slot_mapping_by_layer_310 = [
+        context_buffers[layer_block_sizes[layer_name]][:num_context]
+        for layer_name in layer_names
+    ]
+    proposer._dflash_query_slot_mapping_by_layer_310 = [
+        query_buffers[layer_block_sizes[layer_name]][:num_query_total]
+        for layer_name in layer_names
+    ]
+    proposer._dflash_block_table_by_layer_310 = [
+        block_tables[layer_block_sizes[layer_name]]
+        for layer_name in layer_names
+    ]
+
+    draft_model = getattr(proposer.model, "model", None)
+    attention_layers = getattr(draft_model, "_attn_layers", None)
+    if attention_layers is None or len(attention_layers) != len(layer_names):
+        raise RuntimeError(
+            "310P DFlash FULL capture layouts do not match the allocated "
+            "draft attention layers."
+        )
+    for attention, layer_slots, layer_table in zip(
+        attention_layers,
+        proposer._dflash_query_slot_mapping_by_layer_310,
+        proposer._dflash_block_table_by_layer_310,
+    ):
+        attention.impl._dflash_query_slot_mapping_310 = layer_slots
+        attention.impl._dflash_block_table_310 = layer_table
+
+    for builder in metadata_builders:
+        builder._dflash_full_graph_owner_310 = proposer
+
+
 def wrap_dummy_run_with_draft_flag(original):
     """Wrap a proposer ``dummy_run`` so the draft-model forward runs with the
     310P drafting RoPE flag enabled.
@@ -240,20 +330,82 @@ def wrap_dummy_run_with_draft_flag(original):
 
     @functools.wraps(original)
     def dummy_run(self, *args, **kwargs):
-        prev_flag = AscendRotaryEmbedding310._is_drafting_update_enabled
-        AscendRotaryEmbedding310.set_rope_position_flag_310p(True)
-        rope_capacity = (
-            reserve_draft_rope_capacity_310p(
-                getattr(self, "max_num_tokens", 0)
-            )
-            if getattr(self, "method", None) == "dflash"
-            else nullcontext()
+        runtime_mode = kwargs.get(
+            "aclgraph_runtime_mode",
+            args[3] if len(args) > 3 else CUDAGraphMode.NONE,
         )
+        prepared_full_capture = (
+            getattr(self, "method", None) == "dflash"
+            and runtime_mode == CUDAGraphMode.FULL
+        )
+        full_capture_builders = []
+        prev_flag = AscendRotaryEmbedding310._is_drafting_update_enabled
         try:
+            if prepared_full_capture:
+                full_capture_builders = [
+                    attn_group.get_metadata_builder()
+                    for attn_group in self.draft_attn_groups
+                ]
+                num_tokens = kwargs.get(
+                    "num_tokens",
+                    args[0] if args else 0,
+                )
+                num_reqs = kwargs.get(
+                    "num_reqs",
+                    args[1] if len(args) > 1 else 0,
+                )
+                _prepare_dflash_full_graph_capture_310(
+                    self,
+                    num_context=min(
+                        int(num_tokens),
+                        int(getattr(self, "max_query_tokens", num_tokens)),
+                    ),
+                    num_reqs=int(num_reqs),
+                    metadata_builders=full_capture_builders,
+                )
+
+            AscendRotaryEmbedding310.set_rope_position_flag_310p(True)
+            rope_capacity = (
+                reserve_draft_rope_capacity_310p(
+                    getattr(self, "max_num_tokens", 0)
+                )
+                if getattr(self, "method", None) == "dflash"
+                else nullcontext()
+            )
             with rope_capacity:
                 return original(self, *args, **kwargs)
         finally:
             AscendRotaryEmbedding310.set_rope_position_flag_310p(prev_flag)
+            if prepared_full_capture:
+                for builder in full_capture_builders:
+                    if (
+                        getattr(
+                            builder,
+                            "_dflash_full_graph_owner_310",
+                            None,
+                        )
+                        is self
+                    ):
+                        delattr(builder, "_dflash_full_graph_owner_310")
+                draft_model = getattr(self.model, "model", None)
+                for attention in getattr(
+                    draft_model,
+                    "_attn_layers",
+                    [],
+                ):
+                    for attr_name in (
+                        "_dflash_query_slot_mapping_310",
+                        "_dflash_block_table_310",
+                    ):
+                        if hasattr(attention.impl, attr_name):
+                            delattr(attention.impl, attr_name)
+                for attr_name in (
+                    "_dflash_context_slot_mapping_by_layer_310",
+                    "_dflash_query_slot_mapping_by_layer_310",
+                    "_dflash_block_table_by_layer_310",
+                ):
+                    if hasattr(self, attr_name):
+                        delattr(self, attr_name)
 
     return dummy_run
 

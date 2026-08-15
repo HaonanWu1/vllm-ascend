@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from vllm.config import CUDAGraphMode
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.ops import rotary_embedding as rotary_310
@@ -186,6 +187,117 @@ class TestAscendSpecDecodeBaseProposer310(TestBase):
 
         self.assertFalse(AscendRotaryEmbedding310._is_drafting_update_enabled)
 
+    def test_dummy_run_wrapper_prepares_only_dflash_full_capture(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+            wrap_dummy_run_with_draft_flag,
+        )
+
+        def original(self, *args, **kwargs):
+            return "ok"
+
+        wrapped = wrap_dummy_run_with_draft_flag(original)
+        builder = SimpleNamespace()
+        attention_impl = SimpleNamespace()
+        dflash = SimpleNamespace(
+            method="dflash",
+            max_num_tokens=0,
+            max_query_tokens=128,
+            model=SimpleNamespace(
+                model=SimpleNamespace(
+                    _attn_layers=[SimpleNamespace(impl=attention_impl)]
+                )
+            ),
+            draft_attn_groups=[
+                SimpleNamespace(get_metadata_builder=lambda: builder)
+            ],
+        )
+        dspark = SimpleNamespace(
+            method="dspark",
+            max_num_tokens=0,
+            max_query_tokens=128,
+        )
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+            "_prepare_dflash_full_graph_capture_310",
+            create=True,
+            side_effect=lambda owner, **kwargs: (
+                setattr(builder, "_dflash_full_graph_owner_310", owner),
+                setattr(
+                    owner,
+                    "_dflash_context_slot_mapping_by_layer_310",
+                    [object()],
+                ),
+                setattr(
+                    owner,
+                    "_dflash_query_slot_mapping_by_layer_310",
+                    [object()],
+                ),
+                setattr(
+                    owner,
+                    "_dflash_block_table_by_layer_310",
+                    [object()],
+                ),
+                setattr(
+                    attention_impl,
+                    "_dflash_query_slot_mapping_310",
+                    object(),
+                ),
+                setattr(
+                    attention_impl,
+                    "_dflash_block_table_310",
+                    object(),
+                ),
+            ),
+        ) as prepare:
+            self.assertEqual(
+                wrapped(
+                    dflash,
+                    num_tokens=32,
+                    num_reqs=2,
+                    aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                ),
+                "ok",
+            )
+            prepare.assert_called_once_with(
+                dflash,
+                num_context=32,
+                num_reqs=2,
+                metadata_builders=[builder],
+            )
+            self.assertFalse(
+                hasattr(builder, "_dflash_full_graph_owner_310")
+            )
+            for attr_name in (
+                "_dflash_context_slot_mapping_by_layer_310",
+                "_dflash_query_slot_mapping_by_layer_310",
+                "_dflash_block_table_by_layer_310",
+            ):
+                self.assertFalse(hasattr(dflash, attr_name))
+            self.assertFalse(
+                hasattr(
+                    attention_impl,
+                    "_dflash_query_slot_mapping_310",
+                )
+            )
+            self.assertFalse(
+                hasattr(attention_impl, "_dflash_block_table_310")
+            )
+
+            prepare.reset_mock()
+            wrapped(
+                dflash,
+                num_tokens=32,
+                num_reqs=2,
+                aclgraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            )
+            wrapped(
+                dspark,
+                num_tokens=32,
+                num_reqs=2,
+                aclgraph_runtime_mode=CUDAGraphMode.FULL,
+            )
+            prepare.assert_not_called()
+
     def test_dflash_dummy_run_reserves_context_rope_capacity(self):
         from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
             wrap_dummy_run_with_draft_flag,
@@ -210,6 +322,128 @@ class TestAscendSpecDecodeBaseProposer310(TestBase):
             self.assertEqual(len(set(addresses)), 1)
         finally:
             self._reset_draft_rope_buffers()
+
+    def test_dummy_run_wrapper_cleans_partial_full_preparation_on_error(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+            wrap_dummy_run_with_draft_flag,
+        )
+
+        builder = SimpleNamespace()
+        attention_impl = SimpleNamespace()
+        proposer = SimpleNamespace(
+            method="dflash",
+            max_num_tokens=0,
+            max_query_tokens=128,
+            model=SimpleNamespace(
+                model=SimpleNamespace(
+                    _attn_layers=[SimpleNamespace(impl=attention_impl)]
+                )
+            ),
+            draft_attn_groups=[
+                SimpleNamespace(get_metadata_builder=lambda: builder)
+            ],
+        )
+
+        def fail_after_partial_preparation(owner, **kwargs):
+            owner._dflash_query_slot_mapping_by_layer_310 = [object()]
+            attention_impl._dflash_query_slot_mapping_310 = object()
+            builder._dflash_full_graph_owner_310 = owner
+            raise RuntimeError("prepare failed")
+
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+            "_prepare_dflash_full_graph_capture_310",
+            side_effect=fail_after_partial_preparation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "prepare failed"):
+                wrap_dummy_run_with_draft_flag(lambda self: None)(
+                    proposer,
+                    num_tokens=32,
+                    num_reqs=2,
+                    aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                )
+
+        self.assertFalse(
+            hasattr(
+                proposer,
+                "_dflash_query_slot_mapping_by_layer_310",
+            )
+        )
+        self.assertFalse(
+            hasattr(attention_impl, "_dflash_query_slot_mapping_310")
+        )
+        self.assertFalse(
+            hasattr(builder, "_dflash_full_graph_owner_310")
+        )
+
+    def test_dummy_run_wrapper_preserves_builder_lookup_error(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+            wrap_dummy_run_with_draft_flag,
+        )
+
+        builder = SimpleNamespace()
+        attention_impl = SimpleNamespace()
+        lookup_attempts = 0
+
+        def failing_builder_lookup():
+            nonlocal lookup_attempts
+            lookup_attempts += 1
+            if lookup_attempts == 1:
+                raise RuntimeError("prepare builder lookup failed")
+            raise RuntimeError("cleanup builder lookup failed")
+
+        proposer = SimpleNamespace(
+            method="dflash",
+            max_num_tokens=0,
+            max_query_tokens=128,
+            model=SimpleNamespace(
+                model=SimpleNamespace(
+                    _attn_layers=[SimpleNamespace(impl=attention_impl)]
+                )
+            ),
+            draft_attn_groups=[
+                SimpleNamespace(get_metadata_builder=lambda: builder),
+                SimpleNamespace(
+                    get_metadata_builder=failing_builder_lookup
+                ),
+            ],
+        )
+
+        def fail_during_builder_lookup(owner, **kwargs):
+            owner._dflash_query_slot_mapping_by_layer_310 = [object()]
+            attention_impl._dflash_query_slot_mapping_310 = object()
+            first_builder = owner.draft_attn_groups[0].get_metadata_builder()
+            first_builder._dflash_full_graph_owner_310 = owner
+            owner.draft_attn_groups[1].get_metadata_builder()
+
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+            "_prepare_dflash_full_graph_capture_310",
+            side_effect=fail_during_builder_lookup,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "prepare builder lookup failed",
+            ):
+                wrap_dummy_run_with_draft_flag(lambda self: None)(
+                    proposer,
+                    num_tokens=32,
+                    num_reqs=2,
+                    aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                )
+
+        self.assertFalse(
+            hasattr(
+                proposer,
+                "_dflash_query_slot_mapping_by_layer_310",
+            )
+        )
+        self.assertFalse(
+            hasattr(attention_impl, "_dflash_query_slot_mapping_310")
+        )
+        self.assertFalse(
+            hasattr(builder, "_dflash_full_graph_owner_310")
+        )
 
     def test_dspark_dummy_run_does_not_reserve_dflash_rope_capacity(self):
         from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (

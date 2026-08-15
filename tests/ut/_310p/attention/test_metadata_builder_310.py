@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -23,6 +24,81 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 
 class TestAscendAttentionMetadataBuilder310Causal(TestBase):
+    def test_full_dflash_capture_and_runtime_share_proposer_buffers(self):
+        builder = object.__new__(AscendAttentionMetadataBuilder310)
+        builder.device = torch.device("cpu")
+        builder._query_lens_cpu_buffer = torch.zeros(8, dtype=torch.int32)
+        owner = SimpleNamespace(
+            num_speculative_tokens=15,
+            slot_mapping_group=[
+                torch.full((64,), -1, dtype=torch.int32)
+            ],
+            seq_lens_group=[torch.zeros(8, dtype=torch.int32)],
+            query_start_loc_group=[torch.zeros(9, dtype=torch.int32)],
+        )
+        builder._dflash_full_graph_owner_310 = owner
+
+        capture_common = MagicMock()
+        capture_common.num_reqs = 2
+        capture_common.causal = False
+        capture_common.max_query_len = 16
+        capture_common.num_actual_tokens = 32
+        capture_common.query_start_loc = torch.tensor(
+            [0, 16, 32], dtype=torch.int32
+        )
+        capture_common.query_start_loc_cpu = capture_common.query_start_loc
+        capture_common.seq_lens = torch.tensor([20, 24], dtype=torch.int32)
+        capture_common.slot_mapping = torch.arange(32, dtype=torch.int32)
+        capture_common._seq_lens_cpu = torch.tensor(
+            [20, 24], dtype=torch.int32
+        )
+        capture_common.attn_state = AscendAttentionState.ChunkedPrefill
+
+        base_metadata = MagicMock()
+        base_metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        with (
+            patch.object(
+                AscendAttentionMetadataBuilder310.__bases__[0],
+                "build",
+                return_value=base_metadata,
+            ) as base_build,
+            patch(
+                "vllm_ascend._310p.attention.metadata_builder."
+                "is_compressed_mask_supported",
+                return_value=False,
+            ),
+        ):
+            result = builder.build(0, capture_common)
+
+        common_seen = base_build.call_args.args[1]
+        self.assertEqual(
+            common_seen.query_start_loc.data_ptr(),
+            owner.query_start_loc_group[0].data_ptr(),
+        )
+        self.assertEqual(
+            common_seen.seq_lens.data_ptr(),
+            owner.seq_lens_group[0].data_ptr(),
+        )
+        self.assertEqual(
+            common_seen.slot_mapping.data_ptr(),
+            owner.slot_mapping_group[0].data_ptr(),
+        )
+        self.assertEqual(
+            result.query_start_loc.data_ptr(),
+            owner.query_start_loc_group[0].data_ptr(),
+        )
+        self.assertEqual(
+            result.seq_lens.data_ptr(),
+            owner.seq_lens_group[0].data_ptr(),
+        )
+        torch.testing.assert_close(
+            owner.seq_lens_group[0][:2],
+            torch.tensor([36, 40], dtype=torch.int32),
+        )
+        self.assertFalse(
+            hasattr(builder, "_dflash_full_graph_owner_310")
+        )
+
     def test_build_non_causal_uses_zero_compressed_mask(self):
         builder = object.__new__(AscendAttentionMetadataBuilder310)
         builder.device = torch.device("cpu")

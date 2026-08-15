@@ -20,6 +20,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from tests.ut.base import TestBase
+from vllm_ascend._310p.spec_decode import dflash_proposer_310
 from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
     AscendDflashProposer310,
     _copy_and_expand_inputs_ascendc,
@@ -498,6 +499,106 @@ class TestCopyAndExpandInputsAscendC(TestBase):
         # One persistent context buffer and one persistent query buffer are
         # needed for the secondary layout; replay must reuse both.
         self.assertEqual(empty_like.call_count, 2)
+
+    def test_full_capture_prebinds_runtime_dflash_layout_buffers(self):
+        num_context = 32
+        num_query_total = 32
+        fake_self = self._make_self(
+            num_query_total=num_query_total,
+            num_context=num_context,
+        )
+        fake_self.num_speculative_tokens = 15
+        fake_self.kernel_block_size = 64
+        fake_self.attn_layer_names = ["layer.0", "layer.1"]
+        fake_self._dflash_layer_block_sizes_310 = {
+            "layer.0": 64,
+            "layer.1": 128,
+        }
+        source_table = torch.arange(16, dtype=torch.int32).view(2, 8)
+        fake_self.runner.input_batch.block_table = [
+            SimpleNamespace(
+                block_size=128,
+                get_device_tensor=lambda: source_table,
+            )
+        ]
+        fake_self.slot_mapping_group = [
+            torch.full((64,), -1, dtype=torch.int32)
+        ]
+        fake_self.seq_lens_group = [torch.zeros(8, dtype=torch.int32)]
+        fake_self.query_start_loc_group = [
+            torch.zeros(9, dtype=torch.int32)
+        ]
+        attention_layers = [
+            SimpleNamespace(impl=SimpleNamespace()),
+            SimpleNamespace(impl=SimpleNamespace()),
+        ]
+        fake_self.model = SimpleNamespace(
+            model=SimpleNamespace(_attn_layers=attention_layers)
+        )
+        builder = SimpleNamespace()
+        fake_self.draft_attn_groups = [
+            SimpleNamespace(get_metadata_builder=lambda: builder)
+        ]
+
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+            "_ensure_kernel_block_size_matches_cache_310"
+        ):
+            dflash_proposer_310._prepare_dflash_full_graph_capture_310(
+                fake_self,
+                num_context=num_context,
+                num_reqs=2,
+            )
+
+        query_by_layer = fake_self._dflash_query_slot_mapping_by_layer_310
+        context_by_layer = (
+            fake_self._dflash_context_slot_mapping_by_layer_310
+        )
+        tables_by_layer = fake_self._dflash_block_table_by_layer_310
+        self.assertIs(builder._dflash_full_graph_owner_310, fake_self)
+        self.assertEqual(len(query_by_layer), 2)
+        self.assertEqual(len(context_by_layer), 2)
+        self.assertEqual(len(tables_by_layer), 2)
+        self.assertIs(
+            attention_layers[0].impl._dflash_query_slot_mapping_310,
+            query_by_layer[0],
+        )
+        self.assertIs(
+            attention_layers[1].impl._dflash_block_table_310,
+            tables_by_layer[1],
+        )
+
+        addresses = (
+            [tensor.data_ptr() for tensor in query_by_layer],
+            [tensor.data_ptr() for tensor in context_by_layer],
+            [tensor.data_ptr() for tensor in tables_by_layer],
+        )
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310."
+            "_ensure_kernel_block_size_matches_cache_310"
+        ):
+            dflash_proposer_310._prepare_dflash_full_graph_capture_310(
+                fake_self,
+                num_context=num_context,
+                num_reqs=2,
+            )
+        self.assertEqual(
+            addresses,
+            (
+                [
+                    tensor.data_ptr()
+                    for tensor in fake_self._dflash_query_slot_mapping_by_layer_310
+                ],
+                [
+                    tensor.data_ptr()
+                    for tensor in fake_self._dflash_context_slot_mapping_by_layer_310
+                ],
+                [
+                    tensor.data_ptr()
+                    for tensor in fake_self._dflash_block_table_by_layer_310
+                ],
+            ),
+        )
 
     def test_heterogeneous_block_table_buffer_is_allocated_once(self):
         num_context = 12

@@ -105,6 +105,55 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         )
         return buffer
 
+    def _bind_dflash_full_capture_buffers(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> None:
+        """Use the replay-owned buffers for one DFlash FULL dummy build."""
+        owner = getattr(self, "_dflash_full_graph_owner_310", None)
+        if owner is None:
+            return
+        delattr(self, "_dflash_full_graph_owner_310")
+
+        num_reqs = int(common_attn_metadata.num_reqs)
+        query_len = int(common_attn_metadata.max_query_len or 0)
+        if (
+            common_attn_metadata.causal
+            or query_len != owner.num_speculative_tokens + 1
+            or int(common_attn_metadata.num_actual_tokens)
+            != num_reqs * query_len
+        ):
+            return
+
+        query_start_loc = owner.query_start_loc_group[0][
+            : num_reqs + 1
+        ]
+        source_query_start_loc = common_attn_metadata.query_start_loc[
+            : num_reqs + 1
+        ]
+        if query_start_loc.data_ptr() != source_query_start_loc.data_ptr():
+            query_start_loc.copy_(source_query_start_loc)
+        owner.query_start_loc_group[0][num_reqs + 1 :].fill_(0)
+        common_attn_metadata.query_start_loc = query_start_loc
+
+        seq_lens = owner.seq_lens_group[0][:num_reqs]
+        source_seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        if seq_lens.data_ptr() != source_seq_lens.data_ptr():
+            seq_lens.copy_(source_seq_lens)
+            seq_lens.add_(query_len)
+        owner.seq_lens_group[0][num_reqs:].fill_(0)
+        common_attn_metadata.seq_lens = seq_lens
+
+        num_actual_tokens = int(common_attn_metadata.num_actual_tokens)
+        slot_mapping = owner.slot_mapping_group[0]
+        source_slot_mapping = common_attn_metadata.slot_mapping[
+            :num_actual_tokens
+        ]
+        if slot_mapping.data_ptr() != source_slot_mapping.data_ptr():
+            slot_mapping[:num_actual_tokens].copy_(source_slot_mapping)
+        slot_mapping[num_actual_tokens:].fill_(-1)
+        common_attn_metadata.slot_mapping = slot_mapping
+
     def build(
         self,
         common_prefix_len: int,
@@ -112,6 +161,7 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         fast_build: bool = False,
         is_drafting: bool = False,
     ) -> AscendMetadata:
+        self._bind_dflash_full_capture_buffers(common_attn_metadata)
         attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
 
         num_reqs = common_attn_metadata.num_reqs
