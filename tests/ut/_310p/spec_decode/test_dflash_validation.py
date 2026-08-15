@@ -27,6 +27,21 @@ def _counter(name: str, value: int) -> SimpleNamespace:
 
 def test_validation_profiles_fix_workload_and_models() -> None:
     assert DFLASH_K == 15
+    # The fixed mixed-short batch schedules 141 target prefill tokens. Keep a
+    # capture bucket at that exact boundary so PIECEWISE validation neither
+    # falls back to eager nor pads the fixed target prefill to 256 tokens.
+    assert dflash_validation.GRAPH_CAPTURE_SIZES == [
+        16,
+        32,
+        48,
+        64,
+        80,
+        96,
+        112,
+        128,
+        141,
+        256,
+    ]
     assert MODEL_PROFILES["qwen3.5-2b"].target == "/home/models/Qwen3.5-2B"
     assert MODEL_PROFILES["qwen3.5-2b"].draft == "/home/models/Qwen3.5-2B-Dflash"
     assert MODEL_PROFILES["qwen3.5-2b"].expected_target_revision == (

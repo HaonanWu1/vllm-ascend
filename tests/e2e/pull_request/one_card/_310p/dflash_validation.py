@@ -32,7 +32,13 @@ MAX_NUM_SEQS = 8
 MAX_OUTPUT_TOKENS = 128
 SAMPLING_TOP_P = 1
 SAMPLING_TOP_K = 1
-GRAPH_CAPTURE_SIZES = [16, 32, 64, 128]
+# K=15 produces exactly 16 draft/verify tokens per active request. Capture one
+# bucket for every possible mixed-short batch size so steady-state graph runs
+# do not trade launch savings for padded model compute. The exact 141 bucket
+# covers the fixed workload's target prefill; 256 retains a larger mixed gear.
+# The two 19-token calls deliberately stay on the aligned 32-token bucket:
+# a direct 310P ablation showed that an unaligned 19-token graph regresses.
+GRAPH_CAPTURE_SIZES = [16, 32, 48, 64, 80, 96, 112, 128, 141, 256]
 WORKLOAD_NAMES = ("mixed-short", "math500")
 MATH500_DATASET_PATH = Path("/home/datasets/math500-hf-6e4ed1a2/test.jsonl")
 MATH500_DATASET_REVISION = "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be"
