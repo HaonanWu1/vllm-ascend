@@ -843,6 +843,11 @@ class NPUModelRunner310(NPUModelRunner):
             "_dflash_requested_cudagraph_mode_310",
             None,
         )
+        fallback_effective_mode = getattr(
+            self.compilation_config,
+            "_dflash_effective_cudagraph_mode_310",
+            None,
+        )
         requested_mode = (
             fallback_requested_mode
             if fallback_requested_mode is not None
@@ -856,16 +861,16 @@ class NPUModelRunner310(NPUModelRunner):
         with self.temporary_modify_uniform_decode_query_len():
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
         if is_dflash:
-            is_full_atb_fallback = (
-                fallback_requested_mode == CUDAGraphMode.FULL
-                and configured_mode
-                == CUDAGraphMode.FULL_AND_PIECEWISE
+            is_explicit_fallback = (
+                fallback_requested_mode is not None
+                and fallback_effective_mode is not None
+                and configured_mode == fallback_effective_mode
                 and self.cudagraph_dispatcher.cudagraph_mode
-                == CUDAGraphMode.FULL_AND_PIECEWISE
+                == fallback_effective_mode
             )
             self._dflash_effective_cudagraph_mode_310 = (
-                CUDAGraphMode.FULL_AND_PIECEWISE
-                if is_full_atb_fallback
+                fallback_effective_mode
+                if is_explicit_fallback
                 else requested_mode
             )
         if capture_graph_modes:

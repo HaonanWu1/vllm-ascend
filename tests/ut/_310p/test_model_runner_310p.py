@@ -848,6 +848,9 @@ def test_dflash_early_fallback_mode_is_remembered() -> None:
     compilation_config = SimpleNamespace(
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         _dflash_requested_cudagraph_mode_310=CUDAGraphMode.FULL,
+        _dflash_effective_cudagraph_mode_310=(
+            CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
     )
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(method="dflash"),
@@ -928,6 +931,82 @@ def test_dflash_early_fallback_effective_mode_drives_dispatch() -> None:
         )
 
     assert runtime_mode == CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.parametrize(
+    "requested_mode",
+    [
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        CUDAGraphMode.FULL,
+    ],
+)
+def test_dflash_explicit_eager_fallback_drives_runner_mode(
+    requested_mode: CUDAGraphMode,
+) -> None:
+    runner, _ = _make_k15_spec_runner(CUDAGraphMode.NONE)
+    runner.compilation_config = runner.vllm_config.compilation_config
+    setattr(
+        runner.compilation_config,
+        "_dflash_requested_cudagraph_mode_310",
+        requested_mode,
+    )
+    setattr(
+        runner.compilation_config,
+        "_dflash_effective_cudagraph_mode_310",
+        CUDAGraphMode.NONE,
+    )
+    del runner._dflash_requested_cudagraph_mode_310
+
+    with (
+        patch(
+            "vllm_ascend._310p.model_runner_310p.NPUModelRunner."
+            "_check_and_update_cudagraph_mode"
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runner._check_and_update_cudagraph_mode([], [])
+
+    assert runner._dflash_requested_cudagraph_mode_310 == requested_mode
+    assert (
+        runner._dflash_effective_cudagraph_mode_310
+        == CUDAGraphMode.NONE
+    )
+
+    runner.attn_state = AscendAttentionState.ChunkedPrefill
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.asarray([0], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+    with (
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.worker.model_runner_v1.enable_sp_by_pass",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend._310p.model_runner_310p."
+            "dflash_diagnostic_enabled",
+            return_value=False,
+        ),
+    ):
+        runtime_mode, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=7,
+            num_reqs=1,
+            num_scheduled_tokens_np=np.asarray([7], dtype=np.int32),
+            max_num_scheduled_tokens=7,
+            use_cascade_attn=False,
+        )
+
+    assert runtime_mode == CUDAGraphMode.NONE
 
 
 @pytest.mark.parametrize(
