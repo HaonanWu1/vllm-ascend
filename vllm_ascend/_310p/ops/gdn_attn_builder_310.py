@@ -21,10 +21,14 @@ and adds ACL graph replay padding for decode / speculative decode metadata.
 from __future__ import annotations
 
 import torch
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
+from vllm_ascend._310p.dflash_full import is_310p_dflash_full
+from vllm_ascend._310p.dflash_full_and_piecewise import (
+    is_310p_dflash_full_and_piecewise,
+)
 from vllm_ascend._310p.dflash_full_decode_only import (
     is_310p_dflash_full_decode_only,
 )
@@ -37,6 +41,18 @@ from vllm_ascend.ops.gdn_attn_builder import (
 )
 
 
+def _should_pad_spec_tokens_to_graph_descriptor(
+    vllm_config,
+    *,
+    use_full_graph: bool,
+) -> bool:
+    """Keep Hybrid/FDO FULL spec-token views at descriptor extent."""
+    return use_full_graph and (
+        is_310p_dflash_full_decode_only(vllm_config)
+        or is_310p_dflash_full_and_piecewise(vllm_config)
+    )
+
+
 class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
     """310P overrides on top of :class:`AscendGDNAttentionMetadataBuilder`.
 
@@ -45,6 +61,12 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
     """
 
     use_full_cuda_graph: bool
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        if is_310p_dflash_full(vllm_config):
+            return AttentionCGSupport.ALWAYS
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
 
     def _build_prefill_has_initial_state_and_causal_conv1d_meta(
         self,
@@ -265,7 +287,12 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
                 attn_metadata,
                 graph_batch_size,
                 common_attn_metadata.num_input_tokens,
-                pad_to_graph_descriptor=is_310p_dflash_full_decode_only(self.vllm_config),
+                pad_to_graph_descriptor=(
+                    _should_pad_spec_tokens_to_graph_descriptor(
+                        self.vllm_config,
+                        use_full_graph=use_full_graph,
+                    )
+                ),
             )
         elif (
             attn_metadata.num_prefills == 0
