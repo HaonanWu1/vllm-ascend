@@ -498,6 +498,25 @@
 #       Remove this patch when vLLM PR #42524 and #44243 is included in the supported
 #       upstream vLLM version.
 #
+# ** 16. File: platform/patch_mamba_scheduler_310.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler`
+#    Why:
+#       DFlash uses smaller draft KV blocks than target/Mamba blocks on 310P.
+#       Upstream scheduling can therefore cross a reusable Mamba checkpoint
+#       without materializing its recurrent state, and it also treats DFlash as
+#       EAGLE when constructing the KV coordinator.
+#    How:
+#       Split DFlash prefill at absolute target/Mamba block boundaries. During
+#       DFlash Scheduler construction, use a scoped ContextVar so the Ascend KV
+#       coordinator can disable only EAGLE KV-tail drop/peek semantics while
+#       preserving DFlash lookahead and speculative scheduling behavior.
+#    Related PR (if no, explain why):
+#       No. This is specific to the 310P mixed DFlash KV layout.
+#    Future Plan:
+#       Remove this patch when upstream separates speculative scheduling method
+#       identity from EAGLE KV ownership policy and supports mixed checkpoints.
+#
 # * Worker Patch:
 # ===============
 #

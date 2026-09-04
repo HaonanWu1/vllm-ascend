@@ -135,6 +135,16 @@ def _snapshot_num_computed_tokens_to_device(
     )
 
 
+def _wait_for_accepted_tokens_event_310(
+    runner: Any,
+    use_async_device_metadata: bool,
+) -> None:
+    """Order the current stream after async accepted-token state updates."""
+    event = runner.num_accepted_tokens_event
+    if use_async_device_metadata and event is not None:
+        torch.npu.current_stream().wait_event(event)
+
+
 def _copy_positions_via_int32_staging_310(
     positions: torch.Tensor,
     base_i32: torch.Tensor,
@@ -655,6 +665,11 @@ class NPUModelRunner310(NPUModelRunner):
             and bool(prev_req_id_to_index)
             and not self.use_cp
         )
+
+        # _update_states_after_model_execute runs on global_stream().  The
+        # device-only path below consumes its accepted-token state on the
+        # current stream, so add an explicit device-side dependency.
+        _wait_for_accepted_tokens_event_310(self, use_async_device_metadata)
 
         if not use_async_device_metadata:
             if self.num_accepted_tokens_event is not None:

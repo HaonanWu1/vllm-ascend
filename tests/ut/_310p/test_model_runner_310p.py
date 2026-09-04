@@ -29,6 +29,7 @@ from vllm_ascend._310p.model_runner_310p import (
     NPUModelRunner310,
     _resize_dflash_draft_kv_cache_specs,
     _snapshot_num_computed_tokens_to_device,
+    _wait_for_accepted_tokens_event_310,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
@@ -80,6 +81,44 @@ def test_prepare_inputs_uses_device_metadata_after_async_correction() -> None:
     device_source = source[device_start:device_end]
     assert device_source.count("update_num_computed_tokens_for_batch_change(") == 1
     assert "_snapshot_num_computed_tokens_to_device(" in device_source
+
+
+def test_async_device_metadata_waits_for_global_state_update() -> None:
+    event = MagicMock()
+    consumer_stream = MagicMock()
+    runner = SimpleNamespace(num_accepted_tokens_event=event)
+
+    with patch.object(
+        model_runner_310p.torch.npu,
+        "current_stream",
+        return_value=consumer_stream,
+    ):
+        _wait_for_accepted_tokens_event_310(runner, True)
+
+    consumer_stream.wait_event.assert_called_once_with(event)
+    event.synchronize.assert_not_called()
+
+
+def test_async_device_metadata_wait_skips_non_async_path() -> None:
+    consumer_stream = MagicMock()
+    runner = SimpleNamespace(num_accepted_tokens_event=MagicMock())
+
+    with patch.object(
+        model_runner_310p.torch.npu,
+        "current_stream",
+        return_value=consumer_stream,
+    ):
+        _wait_for_accepted_tokens_event_310(runner, False)
+
+    consumer_stream.wait_event.assert_not_called()
+
+
+def test_async_device_metadata_wait_is_before_first_gpu_consumer() -> None:
+    source = _prepare_inputs_source()
+    wait_position = source.index("_wait_for_accepted_tokens_event_310(")
+    first_consumer_position = source.index("self.num_accepted_tokens.gpu.fill_(1)")
+
+    assert wait_position < first_consumer_position
 
 
 def test_num_computed_tokens_snapshot_isolated_from_deferred_correction() -> None:
@@ -454,6 +493,33 @@ def test_async_correction_remaps_lengths_and_accepted_counts() -> None:
         num_accepted_tokens,
         torch.tensor([2, 4, 1], dtype=torch.int32),
     )
+
+
+@pytest.mark.parametrize(
+    ("valid_count", "expected_computed"),
+    [
+        (1, 101),
+        (16, 116),
+    ],
+)
+def test_async_correction_handles_all_rejected_and_all_accepted(
+    valid_count,
+    expected_computed,
+) -> None:
+    num_computed_tokens = torch.tensor([100], dtype=torch.int32)
+    num_accepted_tokens = torch.ones(1, dtype=torch.int32)
+
+    update_num_computed_tokens_for_batch_change(
+        num_computed_tokens,
+        num_accepted_tokens,
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([valid_count], dtype=torch.int32),
+        torch.tensor([15], dtype=torch.int32),
+        torch.tensor([116], dtype=torch.int32),
+    )
+
+    assert num_computed_tokens.item() == expected_computed
+    assert num_accepted_tokens.item() == valid_count
 
 
 class TestNPUModelRunner310(TestBase):

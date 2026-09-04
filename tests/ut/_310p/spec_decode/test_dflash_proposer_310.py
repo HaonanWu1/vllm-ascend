@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -299,6 +300,333 @@ def test_compute_slots_supports_mixed_physical_block_sizes():
     assert slots_128.tolist() == [1343, 1344, 1407, 1408]
 
 
+def test_convert_block_table_layout_preserves_physical_pages():
+    source = np.array(
+        [[*range(100, 110), *range(40, 50), *([0] * 10)]],
+        dtype=np.int32,
+    )
+
+    converted = dflash_proposer_310._convert_block_table_layout_310(
+        source,
+        num_source_blocks_per_row=np.array([20], dtype=np.int32),
+        physical_block_size=640,
+        source_block_size=64,
+        target_block_size=128,
+    )
+
+    assert converted[0, :10].tolist() == [
+        50,
+        51,
+        52,
+        53,
+        54,
+        20,
+        21,
+        22,
+        23,
+        24,
+    ]
+    assert np.all(converted[0, 10:] == 0)
+
+
+def test_convert_block_table_layout_rejects_broken_source_chunk():
+    source = np.array(
+        [[100, 102, *range(103, 111)]],
+        dtype=np.int32,
+    )
+
+    with pytest.raises(ValueError, match="contiguous logical blocks"):
+        dflash_proposer_310._convert_block_table_layout_310(
+            source,
+            np.array([10], dtype=np.int32),
+            640,
+            64,
+            128,
+        )
+
+
+def test_converted_128_table_maps_second_physical_page_correctly():
+    block_table = torch.tensor(
+        [[50, 51, 52, 53, 54, 20, 21, 22, 23, 24]],
+        dtype=torch.int32,
+    )
+    positions = torch.tensor([0, 639, 640, 1279], dtype=torch.int32)
+    request_ids = torch.zeros(4, dtype=torch.long)
+
+    slots = _compute_slots_for_block_size_310(
+        positions,
+        request_ids,
+        block_table,
+        128,
+    )
+
+    assert slots.tolist() == [6400, 7039, 2560, 3199]
+
+
+def test_prepare_block_tables_reuses_matching_source_layout():
+    source = np.array([[*range(50, 55)]], dtype=np.int32)
+    source_tensor = torch.from_numpy(source)
+    source_table = SimpleNamespace(
+        block_size=128,
+        physical_block_size=640,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        max_num_reqs=1,
+        num_blocks_per_row=np.array([5], dtype=np.int32),
+        get_numpy_array=lambda: source,
+    )
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(
+            input_batch=SimpleNamespace(block_table=[source_table]),
+            pin_memory=False,
+        ),
+        kv_cache_gid=0,
+        device=torch.device("cpu"),
+    )
+
+    tables = dflash_proposer_310._prepare_block_tables_by_size_310(
+        proposer,
+        SimpleNamespace(block_table_tensor=source_tensor),
+        {128},
+        1,
+    )
+
+    assert tables[128] is source_tensor
+    assert proposer._dflash_block_table_buffers_by_size_310 == {}
+
+
+def test_prepare_block_tables_builds_persistent_matching_layout():
+    source = np.array(
+        [[*range(100, 110), *range(40, 50)]],
+        dtype=np.int32,
+    )
+    source_tensor = torch.from_numpy(source)
+    source_table = SimpleNamespace(
+        block_size=64,
+        physical_block_size=640,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        max_num_reqs=1,
+        num_blocks_per_row=np.array([20], dtype=np.int32),
+        get_numpy_array=lambda: source,
+    )
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(
+            input_batch=SimpleNamespace(block_table=[source_table]),
+            pin_memory=False,
+        ),
+        kv_cache_gid=0,
+        device=torch.device("cpu"),
+    )
+
+    tables = dflash_proposer_310._prepare_block_tables_by_size_310(
+        proposer,
+        SimpleNamespace(block_table_tensor=source_tensor),
+        {64, 128},
+        1,
+    )
+
+    assert tables[64] is source_tensor
+    assert tables[128].tolist() == [[50, 51, 52, 53, 54, 20, 21, 22, 23, 24]]
+    assert 128 in proposer._dflash_block_table_buffers_by_size_310
+
+
+def test_prepare_block_tables_rejects_mixed_layout_with_cp():
+    source_table = SimpleNamespace(
+        block_size=64,
+        physical_block_size=640,
+        dcp_world_size=2,
+        pcp_world_size=1,
+    )
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(
+            input_batch=SimpleNamespace(block_table=[source_table]),
+        ),
+        kv_cache_gid=0,
+    )
+
+    with pytest.raises(RuntimeError, match="context parallelism"):
+        dflash_proposer_310._prepare_block_tables_by_size_310(
+            proposer,
+            SimpleNamespace(block_table_tensor=torch.empty(0)),
+            {64, 128},
+            1,
+        )
+
+
+@dataclass
+class _CommonMetadataStub:
+    block_table_tensor: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
+def test_per_layer_metadata_replaces_table_and_slots_together(monkeypatch):
+    table64 = torch.tensor([[100, 101]], dtype=torch.int32)
+    table128 = torch.tensor([[50]], dtype=torch.int32)
+    slots64 = torch.tensor([6400], dtype=torch.int32)
+    slots128 = torch.tensor([6400], dtype=torch.int32)
+    proposer = SimpleNamespace(
+        vllm_config=SimpleNamespace(),
+        attn_layer_names=["layer64", "layer128"],
+        _dflash_block_table_by_layer_310={
+            "layer64": table64,
+            "layer128": table128,
+        },
+        _dflash_query_slot_mapping_by_layer_310={
+            "layer64": slots64,
+            "layer128": slots128,
+        },
+        runner=SimpleNamespace(get_model=lambda: object()),
+    )
+    builder = MagicMock()
+    builder.build.side_effect = lambda _, metadata, __, **kwargs: metadata
+    monkeypatch.setattr(
+        dflash_proposer_310,
+        "is_310p_dflash_full_and_piecewise",
+        lambda _: True,
+    )
+
+    result = AscendDflashProposer310._build_first_pass_per_layer_attn_metadata(
+        proposer,
+        builder,
+        _CommonMetadataStub(table64, slots64),
+        object(),
+        {},
+    )
+
+    assert result["layer64"].block_table_tensor is table64
+    assert result["layer64"].slot_mapping is slots64
+    assert result["layer128"].block_table_tensor is table128
+    assert result["layer128"].slot_mapping is slots128
+
+
+def test_per_layer_metadata_uses_final_source_and_padded_converted_layout(
+    monkeypatch,
+):
+    original_source_table = torch.tensor(
+        [[100, 101], [200, 201]],
+        dtype=torch.int32,
+    )
+    final_source_table = torch.tensor(
+        [[100, 101], [200, 201], [0, 0], [0, 0]],
+        dtype=torch.int32,
+    )
+    converted_table = torch.tensor(
+        [[50], [100], [0], [0]],
+        dtype=torch.int32,
+    )
+    original_source_slots = torch.tensor([6400, 12800], dtype=torch.int32)
+    final_source_slots = torch.tensor([6400, 12800, -1, -1], dtype=torch.int32)
+    converted_slots = torch.tensor([6400, 12800, -1, -1], dtype=torch.int32)
+    proposer = SimpleNamespace(
+        vllm_config=SimpleNamespace(),
+        attn_layer_names=["layer64", "layer128"],
+        _dflash_source_block_size_310=64,
+        _dflash_block_size_by_layer_310={
+            "layer64": 64,
+            "layer128": 128,
+        },
+        _dflash_block_table_by_layer_310={
+            "layer64": original_source_table,
+            "layer128": converted_table[:2],
+        },
+        _dflash_block_table_buffers_by_size_310={
+            128: (torch.empty_like(converted_table), converted_table),
+        },
+        _dflash_query_slot_mapping_by_layer_310={
+            "layer64": original_source_slots,
+            "layer128": converted_slots[:2],
+        },
+        _dflash_query_slot_mapping_buffers_by_size_310={
+            128: converted_slots,
+        },
+        runner=SimpleNamespace(get_model=lambda: object()),
+    )
+    builder = MagicMock()
+    builder.build.side_effect = lambda _, metadata, __, **kwargs: metadata
+    monkeypatch.setattr(
+        dflash_proposer_310,
+        "is_310p_dflash_full_and_piecewise",
+        lambda _: True,
+    )
+
+    result = AscendDflashProposer310._build_first_pass_per_layer_attn_metadata(
+        proposer,
+        builder,
+        _CommonMetadataStub(final_source_table, final_source_slots),
+        object(),
+        {},
+    )
+
+    assert result["layer64"].block_table_tensor is final_source_table
+    assert result["layer64"].slot_mapping is final_source_slots
+    assert result["layer128"].block_table_tensor.shape == converted_table.shape
+    assert result["layer128"].block_table_tensor.data_ptr() == converted_table.data_ptr()
+    assert result["layer128"].slot_mapping.shape == converted_slots.shape
+    assert result["layer128"].slot_mapping.data_ptr() == converted_slots.data_ptr()
+
+
+def test_mixed_layout_rejects_draft_sliding_window(monkeypatch):
+    source_table = SimpleNamespace(block_size=64)
+    proposer = SimpleNamespace(
+        draft_window_size=512,
+        runner=SimpleNamespace(
+            input_batch=SimpleNamespace(block_table=[source_table]),
+        ),
+        kv_cache_gid=0,
+    )
+    monkeypatch.setattr(
+        dflash_proposer_310,
+        "_draft_cache_block_sizes_310",
+        lambda _: {"layer64": 64, "layer128": 128},
+    )
+
+    with pytest.raises(RuntimeError, match="draft_window_size"):
+        dflash_proposer_310._prepare_per_layer_slot_mappings_310(
+            proposer,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
+            SimpleNamespace(),
+            0,
+            0,
+            0,
+            0,
+        )
+
+
+def test_matching_source_layout_defers_to_final_common_metadata(monkeypatch):
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(
+            input_batch=SimpleNamespace(
+                block_table=[SimpleNamespace(block_size=128)],
+            ),
+        ),
+        kv_cache_gid=0,
+        _dflash_context_slot_mapping_by_layer_310=[torch.tensor([7])],
+    )
+    monkeypatch.setattr(
+        dflash_proposer_310,
+        "_draft_cache_block_sizes_310",
+        lambda _: {"layer0": 128, "layer1": 128},
+    )
+
+    dflash_proposer_310._prepare_per_layer_slot_mappings_310(
+        proposer,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        SimpleNamespace(),
+        0,
+        0,
+        0,
+        0,
+    )
+
+    assert proposer._dflash_query_slot_mapping_by_layer_310 == {}
+    assert proposer._dflash_block_table_by_layer_310 == {}
+    assert proposer._dflash_block_size_by_layer_310 == {}
+    assert not hasattr(proposer, "_dflash_context_slot_mapping_by_layer_310")
+
+
 def test_compute_slots_avoids_dynamic_int64_add_on_310p():
     positions = torch.tensor(
         list(range(75, 91)) + list(range(86, 102)),
@@ -473,7 +801,17 @@ class TestCopyAndExpandInputsAscendC(TestBase):
             _context_slot_mapping_buffer=torch.zeros(num_context, dtype=torch.int32),
         )
 
-    def _run(self, fake_self, target_positions, num_context, batch_size, num_query_per_req, captured):
+    def _run(
+        self,
+        fake_self,
+        target_positions,
+        num_context,
+        batch_size,
+        num_query_per_req,
+        captured,
+        *,
+        sample_from_anchor=False,
+    ):
         num_query_total = batch_size * num_query_per_req
 
         cad = SimpleNamespace(
@@ -511,8 +849,46 @@ class TestCopyAndExpandInputsAscendC(TestBase):
                 num_query_per_req=num_query_per_req,
                 batch_size=batch_size,
                 num_context=num_context,
+                sample_from_anchor=sample_from_anchor,
+            )
+
+    def test_dspark_path_does_not_prepare_dflash_per_layer_layout(self):
+        fake_self = self._make_self(num_query_total=3, num_context=8)
+        captured = {}
+
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310._prepare_per_layer_slot_mappings_310"
+        ) as prepare_layout:
+            self._run(
+                fake_self,
+                torch.arange(8, dtype=torch.int32),
+                num_context=8,
+                batch_size=1,
+                num_query_per_req=3,
+                captured=captured,
+                sample_from_anchor=True,
+            )
+
+        prepare_layout.assert_not_called()
+
+    def test_dflash_path_keeps_per_layer_layout_preparation(self):
+        fake_self = self._make_self(num_query_total=4, num_context=8)
+        captured = {}
+
+        with patch(
+            "vllm_ascend._310p.spec_decode.dflash_proposer_310._prepare_per_layer_slot_mappings_310"
+        ) as prepare_layout:
+            self._run(
+                fake_self,
+                torch.arange(8, dtype=torch.int32),
+                num_context=8,
+                batch_size=1,
+                num_query_per_req=4,
+                captured=captured,
                 sample_from_anchor=False,
             )
+
+        prepare_layout.assert_called_once()
 
     def test_mrope_positions_reduced_to_row0(self):
         # MRoPE models feed positions as [3, num_context]; the op must receive a
