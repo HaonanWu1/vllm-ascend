@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
+from vllm_ascend.patch.platform.dflash_kv_context import resolve_kv_use_eagle
 from vllm_ascend.utils import vllm_version_is
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -252,6 +253,48 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         block_sizes = [self._get_effective_block_size(spec) for spec, _, _ in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
 
+    def _finalize_common_prefix_hit(
+        self,
+        hit_blocks_by_group: list[list[KVCacheBlock] | None],
+        hit_length: int,
+        longest_hit_length: int | None = None,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Trim and validate every FullAttention group at the final hit."""
+        for spec, group_ids, _ in self.attention_groups:
+            if not isinstance(spec, FullAttentionSpec):
+                continue
+
+            effective_block_size = self._get_effective_block_size(spec)
+            if hit_length % effective_block_size != 0:
+                raise RuntimeError(
+                    "FullAttention prefix hit is not block aligned: "
+                    f"hit_length={hit_length}, "
+                    f"block_size={effective_block_size}"
+                )
+
+            expected_blocks = hit_length // effective_block_size
+            for group_id in group_ids:
+                blocks = hit_blocks_by_group[group_id]
+                if blocks is None:
+                    blocks = []
+                    hit_blocks_by_group[group_id] = blocks
+                del blocks[expected_blocks:]
+                if len(blocks) != expected_blocks:
+                    raise RuntimeError(
+                        "FullAttention prefix coverage mismatch: "
+                        f"group_id={group_id}, hit_length={hit_length}, "
+                        f"expected_blocks={expected_blocks}, "
+                        f"actual_blocks={len(blocks)}"
+                    )
+
+        if longest_hit_length is not None:
+            self.num_uncached_common_prefix_tokens = longest_hit_length - hit_length
+
+        return (
+            tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group),
+            hit_length,
+        )
+
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
@@ -285,6 +328,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
+        longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
 
         # Simple hybrid (1 full attn + 1 other): one iteration suffices.
@@ -340,27 +384,19 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
 
+                longest_hit_length = max(longest_hit_length, curr_hit_length)
+
             if curr_hit_length >= hit_length:
                 break
             hit_length = curr_hit_length
             if is_simple_hybrid:
                 break
 
-        # Truncate full attention blocks to final hit_length (if present)
-        # NOTE(zxr): for deepseek-v4, there is two fullattn groups, but
-        # in this function, only the first fullattn group is truncate by
-        # the belowing codes(c4), c128 layer does not truncate, which may
-        # have prefix cache block hit.
-        # Due to slidingwindow attn, deepseek-v4 decode node can't have
-        # any prefix cache hit, because `hit_length` of SWA is 0.
-        spec, group_ids, _ = self.attention_groups[0]
-        if isinstance(spec, FullAttentionSpec):
-            num_blocks = hit_length // self._get_effective_block_size(spec)
-            for group_id in group_ids:
-                if (blks := hit_blocks_by_group[group_id]) is not None:
-                    del blks[num_blocks:]
-
-        return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
+        return self._finalize_common_prefix_hit(
+            hit_blocks_by_group,
+            hit_length,
+            longest_hit_length,
+        )
 
     def find_longest_cache_hit_per_group(
         self,
@@ -448,21 +484,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             if is_simple_hybrid:
                 break
 
-        # Truncate full attention blocks to final hit_length (if present)
-        # NOTE(zxr): for deepseek-v4, there is two fullattn groups, but
-        # in this function, only the first fullattn group is truncate by
-        # the belowing codes(c4), c128 layer does not truncate, which may
-        # have prefix cache block hit.
-        # Due to slidingwindow attn, deepseek-v4 decode node can't have
-        # any prefix cache hit, because `hit_length` of SWA is 0.
-        spec, group_ids, _ = self.attention_groups[0]
-        if isinstance(spec, FullAttentionSpec):
-            num_blocks = hit_length // self._get_effective_block_size(spec)
-            for group_id in group_ids:
-                if (blks := hit_blocks_by_group[group_id]) is not None:
-                    del blks[num_blocks:]
-
-        return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
+        return self._finalize_common_prefix_hit(
+            hit_blocks_by_group,
+            hit_length,
+        )
 
 
 def get_kv_cache_coordinator(
@@ -480,6 +505,7 @@ def get_kv_cache_coordinator(
     metrics_collector: KVCacheMetricsCollector | None = None,
     max_num_batched_tokens: int | None = None,
 ) -> KVCacheCoordinator:
+    use_eagle = resolve_kv_use_eagle(use_eagle)
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
     if _is_deepseek_v4_kv_cache_config(kv_cache_config):
         return AscendHybridKVCacheCoordinator(

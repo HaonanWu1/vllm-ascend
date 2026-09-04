@@ -67,9 +67,7 @@ MAX_SUPPORTED_NUM_SPEC_TOKENS_310P = 15
 
 def _uses_int32_draft_address_math_310(vllm_config: Any) -> bool:
     """Avoid 310P's unaligned dynamic-int64 address arithmetic in graphs."""
-    return is_310p_dflash_full_decode_only(
-        vllm_config
-    ) or is_310p_dflash_full_and_piecewise(vllm_config)
+    return is_310p_dflash_full_decode_only(vllm_config) or is_310p_dflash_full_and_piecewise(vllm_config)
 
 
 def _uses_piecewise_persistent_buffers(vllm_config: Any) -> bool:
@@ -213,6 +211,142 @@ def _compute_slots_for_block_size_310(
     return block_ids_i32 * block_size + positions_i32.remainder(block_size)
 
 
+def _convert_block_table_layout_310(
+    source: np.ndarray,
+    num_source_blocks_per_row: np.ndarray,
+    physical_block_size: int,
+    source_block_size: int,
+    target_block_size: int,
+) -> np.ndarray:
+    """Re-expand physical page IDs for a different kernel block size."""
+    if source.ndim != 2:
+        raise ValueError("source block table must be two-dimensional")
+    if physical_block_size <= 0 or source_block_size <= 0 or target_block_size <= 0:
+        raise ValueError("block sizes must be positive")
+    if physical_block_size % source_block_size != 0 or physical_block_size % target_block_size != 0:
+        raise ValueError("kernel block sizes must divide the physical block size")
+
+    source_ratio = physical_block_size // source_block_size
+    target_ratio = physical_block_size // target_block_size
+    if source.shape[1] % source_ratio != 0:
+        raise ValueError("source block table width must cover whole physical pages")
+    if len(num_source_blocks_per_row) != source.shape[0]:
+        raise ValueError("num_source_blocks_per_row must contain one value per row")
+
+    max_physical_blocks = source.shape[1] // source_ratio
+    result = np.zeros(
+        (source.shape[0], max_physical_blocks * target_ratio),
+        dtype=np.int32,
+    )
+    for row, source_count_value in enumerate(num_source_blocks_per_row.tolist()):
+        source_count = int(source_count_value)
+        if source_count < 0 or source_count > source.shape[1]:
+            raise ValueError("source logical block count is outside the block table")
+        if source_count % source_ratio != 0:
+            raise ValueError("source logical block count must cover whole physical pages")
+
+        output_offset = 0
+        for start in range(0, source_count, source_ratio):
+            chunk = source[row, start : start + source_ratio]
+            base = int(chunk[0])
+            expected = np.arange(
+                base,
+                base + source_ratio,
+                dtype=np.int32,
+            )
+            if base % source_ratio != 0 or not np.array_equal(
+                chunk,
+                expected,
+            ):
+                raise ValueError("source page must contain contiguous logical blocks")
+
+            physical_id = base // source_ratio
+            target_base = physical_id * target_ratio
+            result[
+                row,
+                output_offset : output_offset + target_ratio,
+            ] = np.arange(
+                target_base,
+                target_base + target_ratio,
+                dtype=np.int32,
+            )
+            output_offset += target_ratio
+
+    return result
+
+
+def _prepare_block_tables_by_size_310(
+    proposer: Any,
+    cad: CommonAttentionMetadata,
+    block_sizes: set[int],
+    batch_size: int,
+) -> dict[int, torch.Tensor]:
+    """Return a block table whose logical layout matches every kernel size."""
+    source_table = proposer.runner.input_batch.block_table[proposer.kv_cache_gid]
+    source_block_size = int(source_table.block_size)
+    physical_block_size = int(source_table.physical_block_size)
+    if len(block_sizes) > 1 and source_table.dcp_world_size * source_table.pcp_world_size > 1:
+        raise RuntimeError(
+            "310P DFlash does not support mixed draft kernel block sizes together with context parallelism"
+        )
+
+    buffers_by_size = getattr(
+        proposer,
+        "_dflash_block_table_buffers_by_size_310",
+        None,
+    )
+    if buffers_by_size is None:
+        buffers_by_size = {}
+        proposer._dflash_block_table_buffers_by_size_310 = buffers_by_size
+
+    block_tables_by_size: dict[int, torch.Tensor] = {}
+    for block_size in sorted(block_sizes):
+        if block_size == source_block_size:
+            block_tables_by_size[block_size] = cad.block_table_tensor
+            continue
+
+        source = source_table.get_numpy_array()[:batch_size]
+        source_counts = source_table.num_blocks_per_row[:batch_size]
+        converted = _convert_block_table_layout_310(
+            source,
+            source_counts,
+            physical_block_size,
+            source_block_size,
+            block_size,
+        )
+        target_shape = (
+            source_table.max_num_reqs,
+            converted.shape[1],
+        )
+        buffers = buffers_by_size.get(block_size)
+        if buffers is None or tuple(buffers[0].shape) != target_shape:
+            host_buffer = torch.zeros(
+                target_shape,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=bool(proposer.runner.pin_memory),
+            )
+            device_buffer = torch.zeros(
+                target_shape,
+                dtype=torch.int32,
+                device=proposer.device,
+            )
+            buffers = (host_buffer, device_buffer)
+            buffers_by_size[block_size] = buffers
+
+        host_buffer, device_buffer = buffers
+        host_buffer[:batch_size].copy_(torch.from_numpy(converted))
+        host_buffer[batch_size:].zero_()
+        device_buffer[:batch_size].copy_(
+            host_buffer[:batch_size],
+            non_blocking=bool(proposer.runner.pin_memory),
+        )
+        device_buffer[batch_size:].zero_()
+        block_tables_by_size[block_size] = device_buffer[:batch_size]
+
+    return block_tables_by_size
+
+
 def _recompute_context_slots_310(
     out_context_slot_mapping: torch.Tensor,
     context_positions: torch.Tensor,
@@ -266,6 +400,36 @@ def _prepare_per_layer_slot_mappings_310(
     if not block_sizes_by_layer:
         return
 
+    source_table = proposer.runner.input_batch.block_table[proposer.kv_cache_gid]
+    source_block_size = int(source_table.block_size)
+    converted_block_sizes = {
+        block_size for block_size in block_sizes_by_layer.values() if block_size != source_block_size
+    }
+    if not converted_block_sizes:
+        # The base proposer already applies graph padding and sliding-window
+        # cropping to the source layout. Do not retain an earlier view and then
+        # overwrite that finalized metadata in the per-layer hook.
+        proposer._dflash_query_slot_mapping_by_layer_310 = {}
+        proposer._dflash_block_table_by_layer_310 = {}
+        proposer._dflash_block_size_by_layer_310 = {}
+        if hasattr(proposer, "_dflash_context_slot_mapping_by_layer_310"):
+            del proposer._dflash_context_slot_mapping_by_layer_310
+        return
+    if getattr(proposer, "draft_window_size", None) is not None:
+        # A cropped table's start token and effective seq_len depend on its
+        # logical block size. Supporting several sizes therefore needs
+        # per-layer window metadata, not just per-layer table/slot tensors.
+        raise RuntimeError(
+            "310P DFlash does not support draft_window_size together with converted or mixed draft kernel block sizes"
+        )
+
+    block_tables_by_size = _prepare_block_tables_by_size_310(
+        proposer,
+        cad,
+        set(block_sizes_by_layer.values()),
+        batch_size,
+    )
+
     context_counts = (cad.query_start_loc[1 : batch_size + 1] - cad.query_start_loc[:batch_size]).clamp(min=0)
     context_req_ids = torch.repeat_interleave(
         torch.arange(batch_size, device=proposer.device),
@@ -274,22 +438,49 @@ def _prepare_per_layer_slot_mappings_310(
     query_req_ids = torch.arange(batch_size, device=proposer.device).repeat_interleave(num_query_per_req)
     context_slots_by_size: dict[int, torch.Tensor] = {}
     query_slots_by_size: dict[int, torch.Tensor] = {}
+    query_slot_buffers_by_size = getattr(
+        proposer,
+        "_dflash_query_slot_mapping_buffers_by_size_310",
+        None,
+    )
+    if query_slot_buffers_by_size is None:
+        query_slot_buffers_by_size = {}
+        proposer._dflash_query_slot_mapping_buffers_by_size_310 = query_slot_buffers_by_size
     use_int32_math = _uses_int32_draft_address_math_310(proposer.vllm_config)
     for block_size in sorted(set(block_sizes_by_layer.values())):
+        block_table = block_tables_by_size[block_size]
         context_slots_by_size[block_size] = _compute_slots_for_block_size_310(
             out_context_positions[:num_context],
             context_req_ids,
-            cad.block_table_tensor,
+            block_table,
             block_size,
             use_int32_math=use_int32_math,
         )
-        query_slots_by_size[block_size] = _compute_slots_for_block_size_310(
+        query_slots = _compute_slots_for_block_size_310(
             out_query_positions[:num_query_total],
             query_req_ids,
-            cad.block_table_tensor,
+            block_table,
             block_size,
             use_int32_math=use_int32_math,
         )
+        if block_size != source_block_size:
+            final_slot_capacity = proposer.slot_mapping_group[0].shape[0]
+            slot_buffer = query_slot_buffers_by_size.get(block_size)
+            if (
+                slot_buffer is None
+                or slot_buffer.shape[0] != final_slot_capacity
+                or slot_buffer.dtype != query_slots.dtype
+            ):
+                slot_buffer = torch.full(
+                    (final_slot_capacity,),
+                    -1,
+                    dtype=query_slots.dtype,
+                    device=proposer.device,
+                )
+                query_slot_buffers_by_size[block_size] = slot_buffer
+            slot_buffer[:num_query_total].copy_(query_slots)
+            slot_buffer[num_query_total:].fill_(-1)
+        query_slots_by_size[block_size] = query_slots
 
     proposer._dflash_context_slot_mapping_by_layer_310 = [
         context_slots_by_size[block_sizes_by_layer[layer_name]] for layer_name in proposer.attn_layer_names
@@ -297,6 +488,11 @@ def _prepare_per_layer_slot_mappings_310(
     proposer._dflash_query_slot_mapping_by_layer_310 = {
         layer_name: query_slots_by_size[block_sizes_by_layer[layer_name]] for layer_name in proposer.attn_layer_names
     }
+    proposer._dflash_block_table_by_layer_310 = {
+        layer_name: block_tables_by_size[block_sizes_by_layer[layer_name]] for layer_name in proposer.attn_layer_names
+    }
+    proposer._dflash_source_block_size_310 = source_block_size
+    proposer._dflash_block_size_by_layer_310 = block_sizes_by_layer
 
 
 def _ensure_kernel_block_size_matches_cache_310(proposer: Any) -> None:
@@ -368,10 +564,7 @@ def wrap_dummy_run_with_draft_flag(original):
             pass
 
         vllm_config = getattr(self, "vllm_config", None)
-        uses_hybrid_graph = (
-            vllm_config is not None
-            and is_310p_dflash_full_and_piecewise(vllm_config)
-        )
+        uses_hybrid_graph = vllm_config is not None and is_310p_dflash_full_and_piecewise(vllm_config)
         rope_num_tokens = num_tokens
         max_query_tokens = getattr(self, "max_query_tokens", None)
         if isinstance(rope_num_tokens, int) and isinstance(max_query_tokens, int):
@@ -520,19 +713,19 @@ def _copy_and_expand_inputs_ascendc(
         use_int32_math=_uses_int32_draft_address_math_310(self.vllm_config),
     )
 
-    # A hybrid DFlash cache group can use several physical cache block sizes.
-    # Build query and context slot mappings for each layout, then retain the
-    # per-layer views for metadata construction and context KV insertion.
-    _prepare_per_layer_slot_mappings_310(
-        self,
-        out_query_positions,
-        out_context_positions,
-        cad,
-        num_query_total,
-        num_query_per_req,
-        num_context,
-        batch_size,
-    )
+    if not sample_from_anchor:
+        # Only DFlash consumes per-layer mixed-layout metadata. DSpark shares
+        # this input builder but keeps its original single-layout path.
+        _prepare_per_layer_slot_mappings_310(
+            self,
+            out_query_positions,
+            out_context_positions,
+            cad,
+            num_query_total,
+            num_query_per_req,
+            num_context,
+            batch_size,
+        )
 
     self.input_ids[:num_query_total].copy_(out_input_ids[:num_query_total])
     self.positions[:num_query_total].copy_(out_query_positions[:num_query_total])
@@ -736,21 +929,82 @@ class AscendDflashProposer310(AscendDflashProposer):
                     attn_metadata.attn_mask = None
             return {layer_name: attn_metadata for layer_name in self.attn_layer_names}
 
-        metadata_by_slots: dict[int, Any] = {}
+        block_tables_by_layer = getattr(
+            self,
+            "_dflash_block_table_by_layer_310",
+            {},
+        )
+        block_sizes_by_layer = getattr(
+            self,
+            "_dflash_block_size_by_layer_310",
+            {},
+        )
+        source_block_size = getattr(
+            self,
+            "_dflash_source_block_size_310",
+            None,
+        )
+        block_table_buffers_by_size = getattr(
+            self,
+            "_dflash_block_table_buffers_by_size_310",
+            {},
+        )
+        query_slot_buffers_by_size = getattr(
+            self,
+            "_dflash_query_slot_mapping_buffers_by_size_310",
+            {},
+        )
+        metadata_by_layout: dict[tuple[int, int], Any] = {}
         per_layer: dict[str, Any] = {}
         for layer_name in self.attn_layer_names:
-            slot_mapping = query_slots_by_layer[layer_name]
-            cache_key = slot_mapping.data_ptr()
-            if cache_key not in metadata_by_slots:
+            block_size = block_sizes_by_layer.get(layer_name)
+            if block_size is not None and block_size == source_block_size:
+                # The base path has already applied eager/full-graph row
+                # adjustment (and, where configured, sliding-window cropping).
+                block_table = common_attn_metadata.block_table_tensor
+                slot_mapping = common_attn_metadata.slot_mapping
+            elif block_size is not None:
+                table_buffers = block_table_buffers_by_size.get(block_size)
+                slot_buffer = query_slot_buffers_by_size.get(block_size)
+                if table_buffers is None or slot_buffer is None:
+                    raise RuntimeError(
+                        "310P DFlash converted layout buffers are missing for "
+                        f"layer={layer_name}, block_size={block_size}"
+                    )
+                block_table_buffer = table_buffers[1]
+                num_rows = common_attn_metadata.block_table_tensor.shape[0]
+                num_slots = common_attn_metadata.slot_mapping.shape[0]
+                if num_rows > block_table_buffer.shape[0] or num_slots > slot_buffer.shape[0]:
+                    raise RuntimeError(
+                        "310P DFlash converted layout buffer is too small for "
+                        f"layer={layer_name}, block_size={block_size}, "
+                        f"rows={num_rows}, slots={num_slots}"
+                    )
+                block_table = block_table_buffer[:num_rows]
+                slot_mapping = slot_buffer[:num_slots]
+            else:
+                # Compatibility with existing single-layout callers and unit
+                # test stubs that do not install the 310P layout descriptors.
+                slot_mapping = query_slots_by_layer[layer_name]
+                block_table = block_tables_by_layer.get(
+                    layer_name,
+                    common_attn_metadata.block_table_tensor,
+                )
+            cache_key = (
+                block_table.data_ptr(),
+                slot_mapping.data_ptr(),
+            )
+            if cache_key not in metadata_by_layout:
                 layer_common_metadata = replace(
                     common_attn_metadata,
+                    block_table_tensor=block_table,
                     slot_mapping=slot_mapping,
                 )
                 layer_metadata = build_metadata(layer_common_metadata)
                 if hasattr(layer_metadata, "causal") and not layer_metadata.causal:
                     layer_metadata.attn_mask = None
-                metadata_by_slots[cache_key] = layer_metadata
-            per_layer[layer_name] = metadata_by_slots[cache_key]
+                metadata_by_layout[cache_key] = layer_metadata
+            per_layer[layer_name] = metadata_by_layout[cache_key]
 
         return per_layer
 
