@@ -197,38 +197,47 @@ def apply_dflash_full_and_piecewise_capture_config(
 
     speculative_config = vllm_config.speculative_config
     verification_width = int(speculative_config.num_speculative_tokens) + 1
-    full_size = portfolio.full_capture_size
-    piecewise_size = portfolio.piecewise_capture_size
-    if full_size % verification_width != 0:
-        raise ValueError(
-            "full_capture_size must be divisible by the DFlash verification "
-            f"width ({verification_width}), got {full_size}"
-        )
+    full_sizes = portfolio.full_capture_sizes
+    piecewise_sizes = portfolio.piecewise_capture_sizes
+    # New PW lists share padding with uniform FULL dispatch. Keep the legacy
+    # scalar contract, but require every opt-in list bucket to be aligned.
+    if isinstance(portfolio.piecewise_capture_size, tuple):
+        for piecewise_size in piecewise_sizes:
+            if piecewise_size % verification_width != 0:
+                raise ValueError(
+                    "piecewise_capture_size list values must be divisible by "
+                    f"the DFlash verification width ({verification_width}), got {piecewise_size}"
+                )
+    for full_size in full_sizes:
+        if full_size % verification_width != 0:
+            raise ValueError(
+                "full_capture_size must be divisible by the DFlash "
+                f"verification width ({verification_width}), got {full_size}"
+            )
 
     scheduler_config = vllm_config.scheduler_config
-    logical_upper_bound = (
-        int(scheduler_config.max_num_seqs) * verification_width
-    )
-    if full_size > logical_upper_bound:
+    logical_upper_bound = int(scheduler_config.max_num_seqs) * verification_width
+    for full_size in full_sizes:
+        if full_size <= logical_upper_bound:
+            continue
         raise ValueError(
             "full_capture_size exceeds the uniform SPEC_DECODE logical "
             f"deployment bound: size={full_size}, "
             f"bound={logical_upper_bound}"
         )
 
-    max_num_batched_tokens = int(
-        scheduler_config.max_num_batched_tokens
-    )
-    if max(piecewise_size, full_size) > max_num_batched_tokens:
+    max_num_batched_tokens = int(scheduler_config.max_num_batched_tokens)
+    if max(*piecewise_sizes, *full_sizes) > max_num_batched_tokens:
         raise ValueError(
             "DFlash FULL_AND_PIECEWISE capture capacity exceeds "
             "max_num_batched_tokens: "
-            f"piecewise={piecewise_size}, full={full_size}, "
+            f"piecewise={portfolio.as_dict()['piecewise_capture_size']}, "
+            f"full={portfolio.as_dict()['full_capture_size']}, "
             f"max_num_batched_tokens={max_num_batched_tokens}"
         )
 
     compilation_config = vllm_config.compilation_config
-    capture_sizes = sorted({piecewise_size, full_size})
+    capture_sizes = sorted({*piecewise_sizes, *full_sizes})
     compilation_config.cudagraph_capture_sizes = capture_sizes
     compilation_config.max_cudagraph_capture_size = capture_sizes[-1]
     return True
@@ -260,8 +269,8 @@ def initialize_dflash_full_and_piecewise_cudagraph_keys(
     compilation_config = dispatcher.compilation_config
     capture_sizes = sorted(
         {
-            portfolio.piecewise_capture_size,
-            portfolio.full_capture_size,
+            *portfolio.piecewise_capture_sizes,
+            *portfolio.full_capture_sizes,
         }
     )
     compilation_config.cudagraph_capture_sizes = capture_sizes
@@ -275,41 +284,38 @@ def initialize_dflash_full_and_piecewise_cudagraph_keys(
     dispatcher._compute_bs_to_padded_graph_size()
 
     lora_cases = dispatcher._get_lora_cases()
-    dispatcher.captured_lora_counts = [
-        lora_count for lora_count in lora_cases if lora_count
-    ]
-    for num_active_loras in lora_cases:
-        piecewise_descriptor = dispatcher._create_padded_batch_descriptor(
-            portfolio.piecewise_capture_size,
-            False,
-            num_active_loras > 0,
-            num_active_loras,
-        )
-        dispatcher.add_cudagraph_key(
-            CUDAGraphMode.PIECEWISE,
-            replace(
-                piecewise_descriptor,
-                num_reqs=None,
-                uniform=False,
-            ),
-        )
+    dispatcher.captured_lora_counts = [lora_count for lora_count in lora_cases if lora_count]
+    for piecewise_size in portfolio.piecewise_capture_sizes:
+        for num_active_loras in lora_cases:
+            piecewise_descriptor = dispatcher._create_padded_batch_descriptor(
+                piecewise_size,
+                False,
+                num_active_loras > 0,
+                num_active_loras,
+            )
+            dispatcher.add_cudagraph_key(
+                CUDAGraphMode.PIECEWISE,
+                replace(
+                    piecewise_descriptor,
+                    num_reqs=None,
+                    uniform=False,
+                ),
+            )
 
     if cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
         if uniform_decode_query_len <= 1:
-            raise ValueError(
-                "DFlash FULL_AND_PIECEWISE requires speculative verification "
-                "width greater than one"
-            )
-        for num_active_loras in lora_cases:
-            dispatcher.add_cudagraph_key(
-                CUDAGraphMode.FULL,
-                dispatcher._create_padded_batch_descriptor(
-                    portfolio.full_capture_size,
-                    True,
-                    num_active_loras > 0,
-                    num_active_loras,
-                ),
-            )
+            raise ValueError("DFlash FULL_AND_PIECEWISE requires speculative verification width greater than one")
+        for full_size in portfolio.full_capture_sizes:
+            for num_active_loras in lora_cases:
+                dispatcher.add_cudagraph_key(
+                    CUDAGraphMode.FULL,
+                    dispatcher._create_padded_batch_descriptor(
+                        full_size,
+                        True,
+                        num_active_loras > 0,
+                        num_active_loras,
+                    ),
+                )
 
     dispatcher.keys_initialized = True
     return True
