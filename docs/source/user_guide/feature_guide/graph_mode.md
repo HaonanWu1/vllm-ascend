@@ -93,8 +93,8 @@ For the detailed meaning of `NONE`, `PIECEWISE`, `FULL`, `FULL_DECODE_ONLY`, and
 
 ### 310P DFlash asymmetric portfolio {: #310p-dflash-asymmetric-portfolio }
 
-Ascend 310P DFlash can explicitly assign one descriptor capacity to
-PIECEWISE and one descriptor capacity to FULL when using
+Ascend 310P DFlash can explicitly assign one or more descriptor capacities to PIECEWISE
+and one or more descriptor capacities to FULL when using
 `FULL_AND_PIECEWISE`. This avoids treating every value in the shared upstream
 `cudagraph_capture_sizes` list as belonging to both runtime modes.
 
@@ -108,25 +108,73 @@ vllm serve /path/to/target-model \
   '{"ascend_compilation_config":{"dflash_full_and_piecewise_capture_config":{"piecewise_capture_size":32,"full_capture_size":80}}}'
 ```
 
-With this example the capture inventory is mode-owned:
+Scalar `full_capture_size` remains supported. To retain multiple FULL graph
+capacities, pass a JSON list instead:
+
+```json
+{
+  "ascend_compilation_config": {
+    "dflash_full_and_piecewise_capture_config": {
+      "piecewise_capture_size": 32,
+      "full_capture_size": [40, 80]
+    }
+  }
+}
+```
+
+With the list example the capture inventory is mode-owned:
 
 - PIECEWISE captures descriptor 32 only;
-- Target FULL captures descriptor 80 only;
-- the Draft FULL island uses the same descriptor 80;
-- no PIECEWISE 80 or FULL 32 graph is created.
+- Target FULL captures descriptors 40 and 80;
+- the Draft FULL island uses the same descriptors 40 and 80;
+- no PIECEWISE 40/80 or FULL 32 graph is created.
 
 The capacities are deployment parameters, not automatically derived values.
-The FULL capacity must be divisible by the speculative verification width
+Every FULL capacity must be divisible by the speculative verification width
 (`num_speculative_tokens + 1`) and fit the configured deployment limits.
 Runtime selection still uses vLLM's existing dispatcher: eligible uniform
 speculative verification that matches the configured FULL descriptor selects
 FULL, compatible prefill/mixed work selects PIECEWISE, and workloads that do
 not fit safely follow the existing PIECEWISE/NONE fallback without truncation.
 
-The current resource-safe production boundary is one PIECEWISE bucket and one
-FULL bucket. Multiple PIECEWISE buckets fail during configuration validation
-instead of risking Event-resource exhaustion during capture. If the new
-configuration is absent, all existing graph-mode behavior is preserved.
+To configure multiple PIECEWISE capacities as well, use a list in
+`piecewise_capture_size`. Every list value, including a one-element list, must
+be divisible by `num_speculative_tokens + 1`: PW and FULL share the padding
+lookup, so an unaligned PW bucket could violate uniform FULL dispatch. The
+historical scalar PW validation remains unchanged:
+
+```json
+{
+  "ascend_compilation_config": {
+    "dflash_full_and_piecewise_capture_config": {
+      "piecewise_capture_size": [128, 256],
+      "full_capture_size": [40, 80]
+    }
+  }
+}
+```
+
+Target and Draft PIECEWISE inventories contain only 128 and 256. Target FULL
+and the Draft FULL island retain 40 and 80. Scalar values remain compatible;
+empty lists, duplicate capacities, non-positive values and values exceeding
+deployment limits are rejected. An explicitly shared size can belong to both
+modes without assigning all sizes to both modes.
+
+The existing dispatcher is unchanged: padding uses the shared size union,
+then checks the mode-owned descriptor. It does not independently search for
+the next larger size owned by each mode. For example, with PIECEWISE `[32, 64]`
+and FULL `[40, 80]`, a non-uniform 33-token batch pads to 40, has no PIECEWISE
+key at 40, and follows the existing NONE fallback; a 48-token non-uniform batch
+uses PIECEWISE 64. Size selection should account for these boundaries.
+
+**Resource boundary:** multi-PIECEWISE configuration is preparation for
+subsequent Event-resource work, not production resource validation. Each
+additional PIECEWISE capacity retains its captured subgraphs, and each
+additional FULL capacity retains Target and Draft graphs for every LoRA case.
+This change does not alter Event allocation or suppress capture failures.
+Keep one PIECEWISE capacity in production until the intended model, graph
+portfolio and Event implementation have passed resource validation. If the
+configuration is absent, existing graph-mode behavior is preserved.
 
 ### Attention backend compatibility
 

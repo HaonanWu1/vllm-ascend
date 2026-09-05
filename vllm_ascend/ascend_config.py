@@ -33,10 +33,10 @@ DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG = (
 
 @dataclass(frozen=True)
 class DFlashFullAndPiecewiseCaptureConfig:
-    """One resource-safe PIECEWISE bucket and one shared FULL bucket."""
+    """Explicit mode-owned PIECEWISE and shared FULL capture capacities."""
 
-    piecewise_capture_size: int
-    full_capture_size: int
+    piecewise_capture_size: int | tuple[int, ...]
+    full_capture_size: int | tuple[int, ...]
 
     @classmethod
     def from_raw(
@@ -46,47 +46,56 @@ class DFlashFullAndPiecewiseCaptureConfig:
         if raw is None:
             return None
         if not isinstance(raw, Mapping):
-            raise ValueError(
-                f"{DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG} must be a mapping"
-            )
+            raise ValueError(f"{DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG} must be a mapping")
 
         expected = {"piecewise_capture_size", "full_capture_size"}
         actual = set(raw)
         if actual != expected:
             raise ValueError(
-                f"{DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG} requires exactly "
-                f"{sorted(expected)}, got {sorted(actual)}"
+                f"{DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG} requires exactly {sorted(expected)}, got {sorted(actual)}"
             )
 
-        piecewise = raw["piecewise_capture_size"]
-        full = raw["full_capture_size"]
-        if isinstance(piecewise, (list, tuple, set)):
-            raise ValueError(
-                "Ascend 310P DFlash FULL_AND_PIECEWISE currently only "
-                "supports one PIECEWISE capture capacity; multiple "
-                "PIECEWISE buckets have not passed Event-resource validation"
-            )
-        if isinstance(full, (list, tuple, set)):
-            raise ValueError(
-                "Ascend 310P DFlash FULL_AND_PIECEWISE currently only "
-                "supports one FULL capture capacity shared by Target and Draft"
-            )
-        for name, value in (
-            ("piecewise_capture_size", piecewise),
-            ("full_capture_size", full),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        parsed: dict[str, int | tuple[int, ...]] = {}
+        for name in ("piecewise_capture_size", "full_capture_size"):
+            value = raw[name]
+            if isinstance(value, list):
+                if not value:
+                    raise ValueError(f"{name} must be a non-empty list")
+                sizes = tuple(value)
+            elif isinstance(value, (tuple, set)):
+                raise ValueError(f"{name} must be a positive integer or a list of positive integers, got {value!r}")
+            else:
+                sizes = (value,)
+            if any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in sizes):
+                raise ValueError(f"{name} must be a positive integer or a list of positive integers, got {value!r}")
+            if len(set(sizes)) != len(sizes):
+                raise ValueError(f"{name} must not contain duplicate capacities, got {value!r}")
+            parsed[name] = value if isinstance(value, int) else sizes
 
         return cls(
-            piecewise_capture_size=piecewise,
-            full_capture_size=full,
+            piecewise_capture_size=parsed["piecewise_capture_size"],
+            full_capture_size=parsed["full_capture_size"],
         )
 
-    def as_dict(self) -> dict[str, int]:
+    @property
+    def piecewise_capture_sizes(self) -> tuple[int, ...]:
+        if isinstance(self.piecewise_capture_size, int):
+            return (self.piecewise_capture_size,)
+        return self.piecewise_capture_size
+
+    @property
+    def full_capture_sizes(self) -> tuple[int, ...]:
+        if isinstance(self.full_capture_size, int):
+            return (self.full_capture_size,)
+        return self.full_capture_size
+
+    def as_dict(self) -> dict[str, int | list[int]]:
         return {
-            "piecewise_capture_size": self.piecewise_capture_size,
-            "full_capture_size": self.full_capture_size,
+            name: value if isinstance(value, int) else list(value)
+            for name, value in (
+                ("piecewise_capture_size", self.piecewise_capture_size),
+                ("full_capture_size", self.full_capture_size),
+            )
         }
 
 
