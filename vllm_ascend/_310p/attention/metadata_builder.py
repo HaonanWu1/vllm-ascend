@@ -190,10 +190,34 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
             )
 
         device = common_attn_metadata.query_start_loc.device
+        # DFlash proposes K+1 queries in one model call. SplitFuse can retain
+        # that host grouping for the whole descriptor, including dummy groups.
+        # Check the existing CPU metadata outside capture; never synchronize
+        # device query lengths to decide whether to replay a graph.
+        uniform_query_width = 0
+        config = getattr(self, "_vllm_config_310", None)
+        spec = getattr(config, "speculative_config", None)
+        k = getattr(spec, "num_speculative_tokens", None)
+        qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+        if (
+            getattr(spec, "method", None) == "dflash"
+            and isinstance(k, int) and k > 0
+            and capacity_tokens % (k + 1) == 0
+            and capacity_tokens // (k + 1) <= capacity_reqs
+            and valid_num_tokens == valid_num_reqs * (k + 1)
+            and isinstance(qsl_cpu, torch.Tensor) and qsl_cpu.device.type == "cpu"
+            and qsl_cpu.ndim == 1 and qsl_cpu.shape[0] >= valid_num_reqs + 1
+            and torch.equal(
+                qsl_cpu[:valid_num_reqs + 1],
+                torch.arange(valid_num_reqs + 1, dtype=qsl_cpu.dtype) * (k + 1),
+            )
+        ):
+            uniform_query_width = k + 1
         cache_key = (
             int(draft_step),
             capacity_reqs,
             capacity_tokens,
+            uniform_query_width,
             max_blocks,
             device.type,
             device.index,
@@ -213,6 +237,7 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
                 capacity_tokens=capacity_tokens,
                 max_blocks=max_blocks,
                 device=device,
+                uniform_query_width=uniform_query_width,
             )
             cache[cache_key] = inputs
 

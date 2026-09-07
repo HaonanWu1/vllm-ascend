@@ -132,6 +132,26 @@ class DFlashHybridDraftForwardACLGraphWrapper310(ACLGraphWrapper):
                 and entry is not None
                 and entry.aclgraph is not None
             ):
+                if captured_inputs.keys() == current_inputs.keys() and any(
+                    captured_inputs[name].uniform_query_width
+                    != current_inputs[name].uniform_query_width
+                    for name in captured_inputs
+                ):
+                    # Host SplitFuse grouping is capture-fixed. A different
+                    # logical layout must not overwrite its device inputs or
+                    # replay that graph. Keep this bypass local to the Draft
+                    # forward island, and restore the caller's context even
+                    # when the uncaptured model call fails.
+                    logger.debug(
+                        "[310p-dflash-full-and-piecewise/draft-island] "
+                        "event=host-grouping-fallback actual_runtime=NONE"
+                    )
+                    saved_mode = forward_context.cudagraph_runtime_mode
+                    forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                    try:
+                        return super().__call__(*args, **kwargs)
+                    finally:
+                        forward_context.cudagraph_runtime_mode = saved_mode
                 self._copy_runtime_inputs_310(
                     captured_inputs,
                     current_inputs,
