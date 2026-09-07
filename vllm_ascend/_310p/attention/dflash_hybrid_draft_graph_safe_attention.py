@@ -4,11 +4,11 @@
 
 """Graph-safe Draft attention for 310P DFlash FULL_AND_PIECEWISE.
 
-The public 310P SplitFuse operator consumes host qLens.  A FULL graph freezes
-those host values at capture time, while Phase 4 replays one Draft model graph
-for different speculative substeps and active request counts.  This private
-entry keeps the graph's physical shapes fixed but derives the logical paged
-attention rows entirely from persistent device tensors.
+SplitFuse consumes capture-fixed host qLens. Uniform DFlash queries retain
+one K+1 group per physical request, while device metadata refreshes the active
+requests and context lengths. This preserves grouped attention without
+changing the model-forward-only graph boundary. Other layouts retain the
+device-driven per-token paged-attention implementation.
 """
 
 from __future__ import annotations
@@ -17,6 +17,14 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
+
+from vllm_ascend._310p.attention.attention_mask import (
+    AttentionMaskBuilder310,
+    is_compressed_mask_supported,
+)
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_spec
+
+MASK_TYPE_NORM_COMPRESS_PAGED_ATTENTION = 5
 
 
 @dataclass(frozen=True)
@@ -31,6 +39,8 @@ class DFlashHybridDraftAttentionInputs310:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     token_indices: torch.Tensor
+    uniform_query_width: int = 0
+    splitfuse_query_lens_cpu: torch.Tensor | None = None
 
     @property
     def capacity_reqs(self) -> int:
@@ -55,9 +65,15 @@ def create_dflash_hybrid_draft_attention_inputs_310(
     capacity_tokens: int,
     max_blocks: int,
     device: torch.device,
+    uniform_query_width: int = 0,
 ) -> DFlashHybridDraftAttentionInputs310:
     if capacity_reqs <= 0 or capacity_tokens <= 0 or max_blocks <= 0:
         raise ValueError("Draft FULL descriptor capacities must be positive")
+    if uniform_query_width < 0 or (uniform_query_width and (
+        capacity_tokens % uniform_query_width
+        or capacity_tokens // uniform_query_width > capacity_reqs
+    )):
+        raise ValueError("Draft FULL uniform query groups do not fit the descriptor")
     return DFlashHybridDraftAttentionInputs310(
         valid_num_reqs=torch.empty(1, dtype=torch.int32, device=device),
         valid_num_tokens=torch.empty(1, dtype=torch.int32, device=device),
@@ -75,6 +91,13 @@ def create_dflash_hybrid_draft_attention_inputs_310(
             capacity_tokens,
             dtype=torch.int32,
             device=device,
+        ),
+        uniform_query_width=uniform_query_width,
+        splitfuse_query_lens_cpu=(
+            torch.full(
+                (capacity_tokens // uniform_query_width,), uniform_query_width,
+                dtype=torch.int32, device="cpu",
+            ) if uniform_query_width else None
         ),
     )
 
@@ -110,6 +133,16 @@ def _validate_inputs_310(inputs: DFlashHybridDraftAttentionInputs310) -> None:
         raise ValueError("Draft FULL request metadata shape mismatch")
     if inputs.block_table.ndim != 2 or inputs.block_table.shape[0] != inputs.capacity_reqs:
         raise ValueError("Draft FULL block table capacity mismatch")
+    if inputs.uniform_query_width:
+        qlens = inputs.splitfuse_query_lens_cpu
+        if (
+            inputs.uniform_query_width < 0
+            or inputs.capacity_tokens % inputs.uniform_query_width
+            or inputs.capacity_tokens // inputs.uniform_query_width > inputs.capacity_reqs
+            or qlens is None or qlens.device.type != "cpu" or qlens.dtype != torch.int32
+            or qlens.shape != (inputs.capacity_tokens // inputs.uniform_query_width,)
+        ):
+            raise ValueError("Draft FULL SplitFuse host grouping is invalid")
 
 
 def update_dflash_hybrid_draft_attention_inputs_310(
@@ -182,6 +215,8 @@ def copy_dflash_hybrid_draft_attention_inputs_310(
     """D2D-refresh the one metadata set whose addresses were captured."""
     _validate_inputs_310(destination)
     _validate_inputs_310(source)
+    if destination.uniform_query_width != source.uniform_query_width:
+        raise ValueError("Draft FULL captured/runtime host grouping differs")
     destination_tensors = (
         destination.valid_num_reqs,
         destination.valid_num_tokens,
@@ -262,7 +297,7 @@ def dflash_hybrid_draft_graph_safe_attention_310(
     scale: float,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the exact Hybrid Draft FULL route without host SplitFuse tiling."""
+    """Run grouped SplitFuse or the generic device-driven Draft FULL route."""
     if query.shape[0] != inputs.capacity_tokens:
         raise ValueError(
             "Draft FULL query capacity does not match its descriptor: "
@@ -270,6 +305,51 @@ def dflash_hybrid_draft_graph_safe_attention_310(
         )
     if output.shape != query.shape:
         raise ValueError("Draft FULL output must retain the query physical shape")
+
+    if inputs.uniform_query_width:
+        _validate_inputs_310(inputs)
+        width = inputs.uniform_query_width
+        num_groups = inputs.capacity_tokens // width
+        # Dummy requests read only allocated cache storage. Give them a full
+        # query-width context so SplitFuse never sees context < query length.
+        # Their output is discarded, including possible NaNs in unused cache.
+        group_indices = inputs.token_indices[:num_groups]
+        context_lens = torch.where(
+            group_indices < inputs.valid_num_reqs[0],
+            inputs.seq_lens[:num_groups],
+            torch.full_like(inputs.seq_lens[:num_groups], width),
+        )
+        arguments = dict(
+            query=query, key_cache=key_cache, value_cache=value_cache,
+            block_table=inputs.block_table[:num_groups],
+            seq_len=inputs.splitfuse_query_lens_cpu, context_lens=context_lens,
+            num_kv_heads=num_kv_heads, num_heads=num_heads,
+            scale_value=scale, out=output,
+        )
+        if is_compressed_mask_supported():
+            torch_npu._npu_paged_attention_splitfuse_v2(
+                **arguments,
+                mask=AttentionMaskBuilder310.get_compressed_non_causal_splitfuse_mask(query.device),
+                mask_type=MASK_TYPE_NORM_COMPRESS_PAGED_ATTENTION,
+            )
+        else:
+            # Same non-causal additive mask as FDO: every query sees all
+            # context columns, but never the unused cache tail. Construct rows
+            # from persistent device lengths; no host query topology changes.
+            if AttentionMaskBuilder310.chunked_prefill_attn_mask is None:
+                AttentionMaskBuilder310.chunked_prefill_attn_mask = (
+                    AttentionMaskBuilder310.gen_causal_additive_mask(
+                        AttentionMaskBuilder310.max_seqlen, query.device,
+                    )
+                )
+            positions = context_lens.index_select(0, inputs.token_indices // width) - 1
+            positions.clamp_min_(0)
+            mask = AttentionMaskBuilder310.chunked_prefill_attn_mask.index_select(0, positions)
+            mask = torch_npu.npu_format_cast(nd_to_nz_spec(mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+            torch_npu._npu_paged_attention_splitfuse(**arguments, mask=mask)
+        invalid = inputs.token_indices >= inputs.valid_num_tokens[0]
+        output.masked_fill_(invalid[:, None, None], 0)
+        return output
 
     view = build_dflash_hybrid_draft_paged_view_310(inputs)
     torch_npu._npu_paged_attention(
