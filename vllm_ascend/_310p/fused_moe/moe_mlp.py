@@ -20,6 +20,47 @@ import torch_npu
 
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 
+_BATCH_SCALE_GATE_UP_X_SHAPE = (640, 2048)
+_BATCH_SCALE_GATE_UP_WEIGHT_SHAPE = (256, 512, 2048)
+_BATCH_SCALE_DOWN_X_SHAPE = (640, 256)
+_BATCH_SCALE_DOWN_WEIGHT_SHAPE = (256, 2048, 256)
+_FRACTAL_NZ_FORMAT = 29
+_INT8_QUANT_MAX = 127.0
+
+
+def _quant_grouped_matmul(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list: torch.Tensor,
+) -> torch.Tensor:
+    # Only use batch scale calculation for shapes validated on 310P. Keep
+    # other workloads on CANN's internal per-token dynamic-quant path.
+    supported_shape = (
+        tuple(x.shape) == _BATCH_SCALE_GATE_UP_X_SHAPE and tuple(weight.shape) == _BATCH_SCALE_GATE_UP_WEIGHT_SHAPE
+    ) or (tuple(x.shape) == _BATCH_SCALE_DOWN_X_SHAPE and tuple(weight.shape) == _BATCH_SCALE_DOWN_WEIGHT_SHAPE)
+    x_scale = None
+    if (
+        supported_shape
+        and x.dtype == torch.float16
+        and weight.dtype == torch.int8
+        and weight_scale.dtype == torch.float32
+        and group_list.dtype == torch.int64
+        and torch_npu.get_npu_format(weight) == _FRACTAL_NZ_FORMAT
+    ):
+        # Reduce each row independently before entering the grouped kernel.
+        # Keep FP32 scale division and a nonzero scale for all-zero rows.
+        absmax = x.abs().amax(dim=-1).float()
+        x_scale = torch.where(absmax == 0, torch.ones_like(absmax), absmax / _INT8_QUANT_MAX)
+    return torch_npu.npu_quant_grouped_matmul_dequant(
+        x=x,
+        quantized_weight=weight,
+        weight_scale=weight_scale,
+        group_list=group_list,
+        quant_mode="pertoken",
+        x_scale=x_scale,
+    )
+
 
 def quant_apply_mlp(
     hidden_states: torch.Tensor,
@@ -34,13 +75,9 @@ def quant_apply_mlp(
         # Convert group_list to cumulative sum format if group_list is count format
         group_list = torch.cumsum(group_list, dim=0)
 
-    hidden_states = torch_npu.npu_quant_grouped_matmul_dequant(
-        x=hidden_states, quantized_weight=w1, weight_scale=w1_scale, group_list=group_list, quant_mode="pertoken"
-    )
+    hidden_states = _quant_grouped_matmul(hidden_states, w1, w1_scale, group_list)
     hidden_states = torch_npu.npu_swiglu(hidden_states)
-    hidden_states = torch_npu.npu_quant_grouped_matmul_dequant(
-        x=hidden_states, quantized_weight=w2, weight_scale=w2_scale, group_list=group_list, quant_mode="pertoken"
-    )
+    hidden_states = _quant_grouped_matmul(hidden_states, w2, w2_scale, group_list)
     return hidden_states
 
 
