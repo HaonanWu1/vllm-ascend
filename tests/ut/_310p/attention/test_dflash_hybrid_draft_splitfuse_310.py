@@ -163,7 +163,7 @@ def test_changed_host_layout_bypasses_replay_without_mutating_captured_inputs(ra
             raise ValueError("test model failure")
         return "uncaptured-result"
 
-    wrapper = object.__new__(proposer.DFlashHybridDraftForwardACLGraphWrapper310)
+    wrapper = object.__new__(proposer.DFlashHybridDraftACLGraphWrapper310)
     wrapper.vllm_config = object()
     wrapper.runtime_mode = CUDAGraphMode.FULL
     wrapper.runnable = run_model
@@ -177,9 +177,9 @@ def test_changed_host_layout_bypasses_replay_without_mutating_captured_inputs(ra
     ):
         if raise_from_model:
             with pytest.raises(ValueError, match="test model failure"):
-                wrapper()
+                wrapper._call_with_metadata()
         else:
-            assert wrapper() == "uncaptured-result"
+            assert wrapper._call_with_metadata() == "uncaptured-result"
     assert observed_modes == [CUDAGraphMode.NONE]
     assert context.cudagraph_runtime_mode is CUDAGraphMode.FULL
     assert captured.valid_num_tokens.tolist() == [16]

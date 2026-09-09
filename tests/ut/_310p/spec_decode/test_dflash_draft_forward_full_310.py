@@ -6,6 +6,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 
@@ -72,7 +73,7 @@ def _hybrid_config():
     )
 
 
-def test_hybrid_full_wraps_only_draft_model_forward_not_merged_tail():
+def test_hybrid_full_wraps_merged_draft_including_context_and_sampling():
     merged_tail = object()
     draft_model = _FakeDraftModel()
     proposer = SimpleNamespace(
@@ -94,7 +95,7 @@ def test_hybrid_full_wraps_only_draft_model_forward_not_merged_tail():
         patch.object(proposer_310, "ACLGraphWrapper", _FakeACLGraphWrapper),
         patch.object(
             proposer_310,
-            "DFlashHybridDraftForwardACLGraphWrapper310",
+            "DFlashHybridDraftACLGraphWrapper310",
             _FakeACLGraphWrapper,
         ),
         patch.object(
@@ -103,15 +104,16 @@ def test_hybrid_full_wraps_only_draft_model_forward_not_merged_tail():
             return_value=True,
         ),
     ):
-        proposer_310.AscendSpecDecodeBaseProposer310._install_hybrid_draft_forward_full_island_310(
+        proposer_310.AscendSpecDecodeBaseProposer310._install_hybrid_draft_full_graph_310(
             proposer
         )
 
-    assert proposer._runnable is merged_tail
-    assert isinstance(proposer.model, _FakeACLGraphWrapper)
-    assert proposer.model.runnable is draft_model
-    assert proposer.model.runtime_mode is CUDAGraphMode.FULL
-    assert proposer.model.component == "draft"
+    assert proposer.model is draft_model
+    assert isinstance(proposer._runnable, _FakeACLGraphWrapper)
+    assert proposer._runnable.runnable is merged_tail
+    assert proposer._runnable.runtime_mode is CUDAGraphMode.FULL
+    assert proposer._runnable.component == "draft"
+    assert proposer._runnable.proposer is proposer
     assert proposer.model.compute_logits("hidden") == ("logits", "hidden")
 
 
@@ -174,7 +176,7 @@ def test_hybrid_draft_model_copies_current_substep_into_captured_device_inputs()
     )
     proposer = SimpleNamespace(vllm_config=_hybrid_config())
     wrapper = object.__new__(
-        proposer_310.DFlashHybridDraftForwardACLGraphWrapper310
+        proposer_310.DFlashHybridDraftACLGraphWrapper310
     )
     wrapper.vllm_config = proposer.vllm_config
     wrapper._hybrid_draft_staging_by_descriptor_310 = {
@@ -202,7 +204,7 @@ def test_hybrid_draft_model_copies_current_substep_into_captured_device_inputs()
         ),
     ):
         forward_context.attn_metadata = step_one
-        assert wrapper() == "replayed"
+        assert wrapper._call_with_metadata() == "replayed"
 
     assert captured_inputs.valid_num_reqs.item() == 2
     assert captured_inputs.valid_num_tokens.item() == 2
@@ -221,7 +223,7 @@ def test_hybrid_draft_model_records_capture_inputs_without_copying_them():
     )
     proposer = SimpleNamespace(vllm_config=_hybrid_config())
     wrapper = object.__new__(
-        proposer_310.DFlashHybridDraftForwardACLGraphWrapper310
+        proposer_310.DFlashHybridDraftACLGraphWrapper310
     )
     wrapper.vllm_config = proposer.vllm_config
     wrapper._hybrid_draft_staging_by_descriptor_310 = {}
@@ -250,7 +252,7 @@ def test_hybrid_draft_model_records_capture_inputs_without_copying_them():
             side_effect=capture,
         ),
     ):
-        assert wrapper() == "captured"
+        assert wrapper._call_with_metadata() == "captured"
 
     assert wrapper._hybrid_draft_staging_by_descriptor_310[descriptor] == {
         "layer.0": captured_inputs
@@ -278,7 +280,7 @@ def test_non_hybrid_does_not_change_existing_draft_wrapper_boundary():
         "is_310p_dflash_full_and_piecewise",
         return_value=False,
     ):
-        proposer_310.AscendSpecDecodeBaseProposer310._install_hybrid_draft_forward_full_island_310(
+        proposer_310.AscendSpecDecodeBaseProposer310._install_hybrid_draft_full_graph_310(
             proposer
         )
 
@@ -300,7 +302,7 @@ def test_patched_load_model_installs_island_on_public_proposer_instance():
         ),
         patch.object(
             proposer_310.AscendSpecDecodeBaseProposer310,
-            "_install_hybrid_draft_forward_full_island_310",
+            "_install_hybrid_draft_full_graph_310",
             installer,
         ),
     ):
@@ -311,3 +313,77 @@ def test_patched_load_model_installs_island_on_public_proposer_instance():
 
     original_load_model.assert_called_once_with(proposer, target_model)
     installer.assert_called_once_with(proposer)
+
+
+def test_merged_draft_refreshes_fixed_inputs_and_restores_logical_context():
+    proposer = SimpleNamespace(
+        num_speculative_tokens=2,
+        attn_layer_names=["layer.0", "layer.1"],
+        token_indices_to_sample=torch.zeros(4, dtype=torch.int64),
+        _dflash_num_context=3,
+        _context_slot_mapping_buffer=torch.tensor([1, 2, 3, 91, 92, 93]),
+        _dflash_context_slot_mapping_by_layer_310=[
+            torch.tensor([10, 11, 12]), torch.tensor([20, 21, 22])
+        ],
+    )
+    wrapper = object.__new__(proposer_310.DFlashHybridDraftACLGraphWrapper310)
+    wrapper.proposer = proposer
+    wrapper._hybrid_context_slots_310 = {}
+    context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
+    original_slots = proposer._dflash_context_slot_mapping_by_layer_310
+    captured = []
+
+    def replay(**kwargs):
+        slots = proposer._dflash_context_slot_mapping_by_layer_310
+        assert proposer._dflash_num_context == 6
+        assert slots[0].tolist() == [10, 11, 12, -1, -1, -1]
+        assert slots[1].tolist() == [20, 21, 22, -1, -1, -1]
+        captured.append((slots[0].data_ptr(), kwargs["token_indices_to_sample"].data_ptr()))
+        return kwargs["token_indices_to_sample"].view(-1, 2).clone()
+
+    wrapper._call_with_metadata = replay
+    with patch.object(proposer_310, "get_forward_context", return_value=context):
+        for indices in ([1, 2], [2, 0]):
+            result = wrapper._call_merged_draft(
+                num_input_tokens=6, token_indices_to_sample=torch.tensor(indices)
+            )
+            assert result.tolist() == [indices]
+            assert proposer._dflash_num_context == 3
+            assert proposer._dflash_context_slot_mapping_by_layer_310 is original_slots
+    assert captured[0] == captured[1]
+
+
+def test_merged_draft_restores_proposer_after_failure():
+    proposer = SimpleNamespace(
+        num_speculative_tokens=2, attn_layer_names=["layer.0"],
+        token_indices_to_sample=torch.zeros(4, dtype=torch.int64),
+        _dflash_num_context=3,
+        _context_slot_mapping_buffer=torch.tensor([1, 2, 3, 91, 92, 93]),
+    )
+    wrapper = object.__new__(proposer_310.DFlashHybridDraftACLGraphWrapper310)
+    wrapper.proposer = proposer
+    wrapper._hybrid_context_slots_310 = {}
+    wrapper._call_with_metadata = Mock(side_effect=RuntimeError("device failure"))
+    with pytest.raises(RuntimeError, match="device failure"):
+        wrapper._call_merged_draft(num_input_tokens=6, token_indices_to_sample=torch.tensor([1, 2]))
+    assert proposer._dflash_num_context == 3
+    assert not hasattr(proposer, "_dflash_context_slot_mapping_by_layer_310")
+
+
+def test_merged_draft_large_context_uses_original_inputs_without_replay():
+    proposer = SimpleNamespace(_dflash_num_context=12)
+    context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
+    wrapper = object.__new__(proposer_310.DFlashHybridDraftACLGraphWrapper310)
+    wrapper.proposer = proposer
+    indices = torch.tensor([1, 2])
+
+    def eager(**kwargs):
+        assert context.cudagraph_runtime_mode is CUDAGraphMode.NONE
+        assert proposer._dflash_num_context == 12
+        assert kwargs["token_indices_to_sample"] is indices
+        return "uncaptured"
+
+    wrapper._call_with_metadata = eager
+    with patch.object(proposer_310, "get_forward_context", return_value=context):
+        assert wrapper._call_merged_draft(num_input_tokens=6, token_indices_to_sample=indices) == "uncaptured"
+    assert context.cudagraph_runtime_mode is CUDAGraphMode.FULL

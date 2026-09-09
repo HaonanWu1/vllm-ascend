@@ -53,11 +53,13 @@ _original_compute_draft_step_slot_mapping = (
 )
 
 
-class DFlashHybridDraftForwardACLGraphWrapper310(ACLGraphWrapper):
-    """Refresh device metadata captured by the six-layer Draft FULL island."""
+class DFlashHybridDraftACLGraphWrapper310(ACLGraphWrapper):
+    """Refresh FAP device inputs around the complete merged Draft graph."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, proposer, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.proposer = proposer
+        self._hybrid_context_slots_310: dict[int, list[torch.Tensor]] = {}
         self._hybrid_draft_staging_by_descriptor_310: dict[
             Any,
             dict[str, DFlashHybridDraftAttentionInputs310],
@@ -107,6 +109,77 @@ class DFlashHybridDraftForwardACLGraphWrapper310(ACLGraphWrapper):
             )
 
     def __call__(self, *args, **kwargs):
+        context = get_forward_context()
+        if (
+            is_310p_dflash_full_and_piecewise(self.vllm_config)
+            and context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            return self._call_merged_draft(**kwargs)
+        return self._call_with_metadata(*args, **kwargs)
+
+    def _call_merged_draft(self, **kwargs):
+        proposer = self.proposer
+        capacity = kwargs["num_input_tokens"]
+        logical_context = proposer._dflash_num_context
+        if logical_context > capacity:
+            # A mixed step can have more context than the decode graph holds.
+            # Keep its original logical inputs and the existing eager path.
+            context = get_forward_context()
+            saved_mode = context.cudagraph_runtime_mode
+            context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            try:
+                return self._call_with_metadata(**kwargs)
+            finally:
+                context.cudagraph_runtime_mode = saved_mode
+
+        indices = kwargs["token_indices_to_sample"]
+        k = proposer.num_speculative_tokens
+        graph_indices = capacity // (k + 1) * k
+        if not (
+            0 <= logical_context <= capacity <= proposer._context_slot_mapping_buffer.numel()
+            and capacity % (k + 1) == 0
+            and indices.numel() % k == 0
+            and indices.numel() <= graph_indices <= proposer.token_indices_to_sample.numel()
+        ):
+            raise RuntimeError("310P FAP merged Draft inputs exceed graph capacity")
+
+        # These tensors were previously consumed outside capture. Keep their
+        # addresses stable, refresh real entries, and invalidate context padding.
+        old_slots = getattr(proposer, "_dflash_context_slot_mapping_by_layer_310", None)
+        source_slots = old_slots if old_slots is not None else [
+            proposer._context_slot_mapping_buffer
+        ] * len(proposer.attn_layer_names)
+        if len(source_slots) != len(proposer.attn_layer_names) or any(
+            slots.numel() < logical_context for slots in source_slots
+        ):
+            raise RuntimeError("310P FAP merged Draft context slots do not match its layers")
+        slots = self._hybrid_context_slots_310.get(capacity)
+        if slots is None:
+            slots = [
+                torch.full_like(proposer._context_slot_mapping_buffer[:capacity], -1)
+                for _ in source_slots
+            ]
+            self._hybrid_context_slots_310[capacity] = slots
+        for destination, source in zip(slots, source_slots):
+            destination[:logical_context].copy_(source[:logical_context])
+            destination[logical_context:].fill_(-1)
+        sample_buffer = proposer.token_indices_to_sample[:graph_indices]
+        sample_buffer[:indices.numel()].copy_(indices)
+        sample_buffer[indices.numel():].zero_()
+        kwargs["token_indices_to_sample"] = sample_buffer
+        proposer._dflash_context_slot_mapping_by_layer_310 = slots
+        proposer._dflash_num_context = capacity
+        try:
+            result = self._call_with_metadata(**kwargs)
+            return result[:indices.numel() // k]
+        finally:
+            proposer._dflash_num_context = logical_context
+            if old_slots is None:
+                del proposer._dflash_context_slot_mapping_by_layer_310
+            else:
+                proposer._dflash_context_slot_mapping_by_layer_310 = old_slots
+
+    def _call_with_metadata(self, *args, **kwargs):
         forward_context = get_forward_context()
         descriptor = forward_context.batch_descriptor
         entry = self.concrete_aclgraph_entries.get(descriptor)
@@ -191,33 +264,32 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
         self._initialize_hybrid_draft_slot_mapping_310()
 
     def load_model(self, model: torch.nn.Module) -> None:
-        """Load normally, then narrow Hybrid FULL to Draft model forward."""
+        """Load normally, retaining the FDO-style merged Draft boundary."""
         _original_load_model(self, model)
-        AscendSpecDecodeBaseProposer310._install_hybrid_draft_forward_full_island_310(
+        AscendSpecDecodeBaseProposer310._install_hybrid_draft_full_graph_310(
             self
         )
 
-    def _install_hybrid_draft_forward_full_island_310(self) -> None:
-        """Move Hybrid FULL capture from merged proposal to model forward."""
+    def _install_hybrid_draft_full_graph_310(self) -> None:
+        """Install FAP input refresh around the merged Draft callable."""
         if not (
             is_310p_dflash_full_and_piecewise(self.vllm_config)
             and self.use_cuda_graph
         ):
             return
 
-        if isinstance(self._runnable, ACLGraphWrapper):
-            self._runnable = self._runnable.unwrap()
-        if isinstance(self.model, ACLGraphWrapper):
-            return
-
-        self.model = DFlashHybridDraftForwardACLGraphWrapper310(
-            self.model,
+        runnable = self._runnable
+        if isinstance(runnable, ACLGraphWrapper):
+            runnable = runnable.unwrap()
+        self._runnable = DFlashHybridDraftACLGraphWrapper310(
+            runnable,
             self.vllm_config,
             runtime_mode=CUDAGraphMode.FULL,
             use_eagle=self.use_eagle,
             enable_enpu=self.enable_enpu,
             component="draft",
             retained_input_provider=self._full_decode_draft_retained_inputs,
+            proposer=self,
         )
 
     def _initialize_hybrid_draft_slot_mapping_310(self) -> None:
