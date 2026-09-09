@@ -15,11 +15,12 @@
 
 from unittest.mock import MagicMock, call, patch
 
+import pytest
 import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.fused_moe.moe_comm_method import AllGatherCommImpl310
-from vllm_ascend._310p.fused_moe.moe_mlp import unified_apply_mlp
+from vllm_ascend._310p.fused_moe.moe_mlp import _quant_grouped_matmul, quant_apply_mlp, unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
     MoEQuantParams,
@@ -161,6 +162,7 @@ class TestUnifiedApplyMLP310(TestBase):
                     weight_scale=w1_scale,
                     group_list=mock_cumsum_out,
                     quant_mode="pertoken",
+                    x_scale=None,
                 ),
                 call(
                     x=mock_npu_swiglu_output,
@@ -168,6 +170,7 @@ class TestUnifiedApplyMLP310(TestBase):
                     weight_scale=w2_scale,
                     group_list=mock_cumsum_out,
                     quant_mode="pertoken",
+                    x_scale=None,
                 ),
             ],
             any_order=True,
@@ -177,3 +180,133 @@ class TestUnifiedApplyMLP310(TestBase):
 
         self.assertEqual(result.shape, hidden_states.shape)
         self.assertEqual(result.dtype, torch.float16)
+
+
+@pytest.fixture
+def quant_gmm_mocks():
+    with (
+        patch("torch_npu.get_npu_format", return_value=29, create=True) as get_format,
+        patch("torch_npu.npu_quant_grouped_matmul_dequant", create=True) as gmm,
+    ):
+        yield get_format, gmm
+
+
+def make_quant_gmm_inputs(
+    rows=640,
+    k=256,
+    n=2048,
+    experts=256,
+    x_dtype=torch.float16,
+    weight_dtype=torch.int8,
+    scale_dtype=torch.float32,
+    group_dtype=torch.int64,
+):
+    x = torch.full((rows, k), 0.5, dtype=x_dtype)
+    # Metadata-only weights avoid allocating hundreds of MB in CPU unit tests.
+    weight = torch.empty((experts, n, k), dtype=weight_dtype, device="meta")
+    scale = torch.empty((experts, n), dtype=scale_dtype, device="meta")
+    groups = torch.empty(experts, dtype=group_dtype, device="meta")
+    return x, weight, scale, groups
+
+
+@pytest.mark.parametrize("k,n", [(2048, 512), (256, 2048)])
+def test_batch_scale_is_per_row_and_preserves_gmm_arguments(quant_gmm_mocks, k, n):
+    get_format, gmm = quant_gmm_mocks
+    x, weight, weight_scale, groups = make_quant_gmm_inputs(k=k, n=n)
+    # Cover all-zero, negative maximum, subnormal and largest finite FP16 rows.
+    x[0] = 0
+    x[1, 0] = -2
+    x[2] = torch.finfo(torch.float16).smallest_normal / 2
+    x[3, 0] = torch.finfo(torch.float16).max
+    original = x.clone()
+
+    result = _quant_grouped_matmul(x, weight, weight_scale, groups)
+
+    kwargs = gmm.call_args.kwargs
+    assert result is gmm.return_value
+    assert kwargs["x"] is x
+    assert kwargs["quantized_weight"] is weight
+    assert kwargs["weight_scale"] is weight_scale
+    assert kwargs["group_list"] is groups
+    assert kwargs["quant_mode"] == "pertoken"
+    assert set(kwargs) == {"x", "quantized_weight", "weight_scale", "group_list", "quant_mode", "x_scale"}
+    expected = original.float().abs().amax(dim=-1) / 127.0
+    expected[0] = 1
+    torch.testing.assert_close(kwargs["x_scale"], expected, rtol=0, atol=0)
+    assert kwargs["x_scale"].shape == (640,)
+    assert kwargs["x_scale"].dtype == torch.float32
+    assert kwargs["x_scale"].device == x.device
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    get_format.assert_called_once_with(weight)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rows": 0},
+        {"rows": 80},
+        {"rows": 639},
+        {"rows": 641},
+        {"rows": 1280},  # K15/C10 must not activate the K7/C10 shape guard.
+        {"k": 128},
+        {"n": 1024},
+        {"experts": 128},
+        {"x_dtype": torch.float32},
+        {"x_dtype": torch.bfloat16},
+        {"weight_dtype": torch.float16},
+        {"scale_dtype": torch.float16},
+        {"group_dtype": torch.int32},
+    ],
+)
+def test_unvalidated_contract_uses_internal_scale(quant_gmm_mocks, overrides):
+    get_format, gmm = quant_gmm_mocks
+    inputs = make_quant_gmm_inputs(**overrides)
+    _quant_grouped_matmul(*inputs)
+    assert gmm.call_args.kwargs["x_scale"] is None
+    get_format.assert_not_called()
+
+
+def test_non_nz_weight_uses_internal_scale(quant_gmm_mocks):
+    get_format, gmm = quant_gmm_mocks
+    get_format.return_value = 2
+    _quant_grouped_matmul(*make_quant_gmm_inputs())
+    assert gmm.call_args.kwargs["x_scale"] is None
+
+
+def test_batch_scale_is_recomputed_for_each_call(quant_gmm_mocks):
+    _, gmm = quant_gmm_mocks
+    x, weight, scale, groups = make_quant_gmm_inputs()
+    _quant_grouped_matmul(x, weight, scale, groups)
+    first_scale = gmm.call_args.kwargs["x_scale"]
+    x.mul_(2)
+    _quant_grouped_matmul(x, weight, scale, groups)
+    torch.testing.assert_close(gmm.call_args.kwargs["x_scale"], first_scale * 2, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("group_list_type", [0, 1])
+def test_quant_mlp_computes_separate_scales_around_swiglu(quant_gmm_mocks, group_list_type):
+    _, gmm = quant_gmm_mocks
+    x, w1, w1_scale, _ = make_quant_gmm_inputs(k=2048, n=512)
+    act_out, w2, w2_scale, _ = make_quant_gmm_inputs()
+    act_out.mul_(4)
+    counts = torch.zeros(256, dtype=torch.int64)
+    counts[-1] = x.shape[0]
+    groups = counts if group_list_type == 1 else counts.cumsum(dim=0)
+    expected_groups = counts.cumsum(dim=0)
+    gmm1_out = torch.empty((640, 512), dtype=torch.float16)
+    gmm2_out = torch.empty_like(x)
+    gmm.side_effect = [gmm1_out, gmm2_out]
+
+    with patch("torch_npu.npu_swiglu", return_value=act_out) as swiglu:
+        result = quant_apply_mlp(x, w1, w1_scale, w2, w2_scale, groups, group_list_type)
+
+    assert result is gmm2_out
+    swiglu.assert_called_once_with(gmm1_out)
+    assert gmm.call_count == 2
+    first, second = [c.kwargs for c in gmm.call_args_list]
+    assert first["x"] is x
+    assert second["x"] is act_out
+    torch.testing.assert_close(first["x_scale"], torch.full((640,), 0.5 / 127.0), rtol=0, atol=0)
+    torch.testing.assert_close(second["x_scale"], torch.full((640,), 2.0 / 127.0), rtol=0, atol=0)
+    torch.testing.assert_close(first["group_list"], expected_groups)
+    torch.testing.assert_close(second["group_list"], expected_groups)
