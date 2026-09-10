@@ -22,6 +22,9 @@ _ORIGINAL_MAMBA_SPLIT_ACCEPTS_COMMON_PREFIX = (
     "num_uncached_common_prefix_tokens" in signature(_original_mamba_block_aligned_split).parameters
 )
 
+# Keep in sync with the 310P chunk GDN kernel's CHUNK_SIZE.
+_GDN_PREFILL_ALIGNMENT = 64
+
 
 def _speculative_config_uses_dflash(speculative_config) -> bool:
     if speculative_config is None:
@@ -45,7 +48,30 @@ def _dflash_scheduler_init(self, vllm_config, *args, **kwargs):
         return _original_scheduler_init(self, vllm_config, *args, **kwargs)
 
     with dflash_scheduler_init_scope():
-        return _original_scheduler_init(self, vllm_config, *args, **kwargs)
+        result = _original_scheduler_init(self, vllm_config, *args, **kwargs)
+    if _needs_dflash_gdn_prefill_alignment(self):
+        self.need_mamba_block_aligned_split = True
+    return result
+
+
+def _needs_dflash_gdn_prefill_alignment(scheduler: Scheduler) -> bool:
+    model_config = getattr(scheduler.vllm_config, "model_config", None)
+    text_config = getattr(model_config, "hf_text_config", None)
+    scheduler_config = getattr(scheduler.vllm_config, "scheduler_config", None)
+    prefill_limit = getattr(scheduler_config, "long_prefill_token_threshold", 0)
+    return (
+        _uses_dflash(scheduler)
+        and getattr(scheduler, "has_mamba_layers", False)
+        and not scheduler.cache_config.enable_prefix_caching
+        # Encoder admission can shorten a chunk below one GDN block. Keep
+        # multimodal scheduling unchanged; this fix is for text-only serving.
+        and getattr(scheduler, "max_num_encoder_input_tokens", None) == 0
+        and getattr(text_config, "model_type", None) in ("qwen3_next", "qwen3_5_text", "qwen3_5_moe_text")
+        # Do not enable a splitter that cannot make forward progress under
+        # explicitly configured sub-block budgets.
+        and getattr(scheduler, "max_num_scheduled_tokens", _GDN_PREFILL_ALIGNMENT) >= _GDN_PREFILL_ALIGNMENT
+        and (prefill_limit == 0 or prefill_limit >= _GDN_PREFILL_ALIGNMENT)
+    )
 
 
 def _needs_dflash_mamba_checkpoint_split(scheduler: Scheduler) -> bool:
@@ -62,6 +88,19 @@ def _dflash_mamba_block_aligned_split(
     num_external_computed_tokens: int = 0,
     num_uncached_common_prefix_tokens: int = 0,
 ) -> int:
+    if _needs_dflash_gdn_prefill_alignment(self):
+        computed = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        scheduled_end = computed + num_new_tokens
+        if computed < prefill_end and scheduled_end < prefill_end:
+            # Non-aligned cuts restart the kernel's 64-token partitioning.
+            # Identical GDN inputs then produce different states/outputs,
+            # which can change greedy tokens downstream. Preserve absolute
+            # chunk boundaries; a final prompt tail need not be aligned.
+            aligned_end = scheduled_end // _GDN_PREFILL_ALIGNMENT * _GDN_PREFILL_ALIGNMENT
+            return max(0, aligned_end - computed)
+        return num_new_tokens
+
     if not _needs_dflash_mamba_checkpoint_split(self):
         original_args = (
             self,
