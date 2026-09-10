@@ -137,11 +137,19 @@ class DFlashHybridDraftACLGraphWrapper310(ACLGraphWrapper):
         graph_indices = capacity // (k + 1) * k
         if not (
             0 <= logical_context <= capacity <= proposer._context_slot_mapping_buffer.numel()
+            and capacity <= proposer._slot_mapping_buffer.numel()
             and capacity % (k + 1) == 0
             and indices.numel() % k == 0
             and indices.numel() <= graph_indices <= proposer.token_indices_to_sample.numel()
         ):
             raise RuntimeError("310P FAP merged Draft inputs exceed graph capacity")
+
+        # Capture retains this query-slot buffer, not slot_mapping_group[0].
+        # Invalidate its stale padding after a larger batch so replay cannot
+        # write padded Draft K/V into cache slots reused by real tokens.
+        num_query_tokens = indices.numel() // k * (k + 1)
+        if num_query_tokens < capacity:
+            proposer._slot_mapping_buffer[num_query_tokens:capacity].fill_(-1)
 
         # These tensors were previously consumed outside capture. Keep their
         # addresses stable, refresh real entries, and invalidate context padding.
