@@ -322,6 +322,7 @@ def test_merged_draft_refreshes_fixed_inputs_and_restores_logical_context():
         token_indices_to_sample=torch.zeros(4, dtype=torch.int64),
         _dflash_num_context=3,
         _context_slot_mapping_buffer=torch.tensor([1, 2, 3, 91, 92, 93]),
+        _slot_mapping_buffer=torch.tensor([10, 11, 12, 91, 92, 93]),
         _dflash_context_slot_mapping_by_layer_310=[
             torch.tensor([10, 11, 12]), torch.tensor([20, 21, 22])
         ],
@@ -359,6 +360,7 @@ def test_merged_draft_restores_proposer_after_failure():
         token_indices_to_sample=torch.zeros(4, dtype=torch.int64),
         _dflash_num_context=3,
         _context_slot_mapping_buffer=torch.tensor([1, 2, 3, 91, 92, 93]),
+        _slot_mapping_buffer=torch.tensor([10, 11, 12, 91, 92, 93]),
     )
     wrapper = object.__new__(proposer_310.DFlashHybridDraftACLGraphWrapper310)
     wrapper.proposer = proposer
@@ -387,3 +389,39 @@ def test_merged_draft_large_context_uses_original_inputs_without_replay():
     with patch.object(proposer_310, "get_forward_context", return_value=context):
         assert wrapper._call_merged_draft(num_input_tokens=6, token_indices_to_sample=indices) == "uncaptured"
     assert context.cudagraph_runtime_mode is CUDAGraphMode.FULL
+
+
+@pytest.mark.parametrize("num_requests", [1, 10])
+def test_merged_draft_invalidates_captured_query_padding(num_requests):
+    # C10 warmup leaves valid addresses in the buffer captured by attention.
+    # Clearing a separate runtime slot group must not hide stale graph slots.
+    query_slots = torch.arange(176, dtype=torch.int32) + 1000
+    before = query_slots.clone()
+    proposer = SimpleNamespace(
+        num_speculative_tokens=15,
+        attn_layer_names=["layer.0"],
+        token_indices_to_sample=torch.zeros(150, dtype=torch.int64),
+        _dflash_num_context=16,
+        _context_slot_mapping_buffer=torch.arange(160, dtype=torch.int32),
+        _slot_mapping_buffer=query_slots,
+        slot_mapping_group=[torch.full((160,), -1, dtype=torch.int32)],
+    )
+    wrapper = object.__new__(proposer_310.DFlashHybridDraftACLGraphWrapper310)
+    wrapper.proposer = proposer
+    wrapper._hybrid_context_slots_310 = {}
+    actual_tokens = {1: 16, 10: 160}[num_requests]
+    captured_pointer = query_slots.data_ptr()
+
+    def replay(**kwargs):
+        assert proposer._slot_mapping_buffer.data_ptr() == captured_pointer
+        assert torch.equal(query_slots[:actual_tokens], before[:actual_tokens])
+        assert query_slots[actual_tokens:160].tolist() == [-1] * (160 - actual_tokens)
+        assert torch.equal(query_slots[160:], before[160:])
+        return torch.zeros((10, 15), dtype=torch.int64)
+
+    wrapper._call_with_metadata = replay
+    result = wrapper._call_merged_draft(
+        num_input_tokens=160,
+        token_indices_to_sample=torch.arange(num_requests * 15),
+    )
+    assert result.shape == (num_requests, 15)
