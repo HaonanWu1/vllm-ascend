@@ -16,6 +16,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 
@@ -100,7 +101,17 @@ def test_non_full_draft_keeps_original_target_positions():
     proposer._get_positions.assert_not_called()
 
 
-def test_full_decode_draft_rope_prepares_distinct_query_and_context_sources():
+@pytest.mark.parametrize(
+    "runtime_mode,uses_fdo,context_tokens",
+    [
+        (CUDAGraphMode.FULL, True, 6),
+        (CUDAGraphMode.FULL, True, 0),
+        (CUDAGraphMode.FULL, True, 160),
+        (CUDAGraphMode.NONE, True, 6),
+        (CUDAGraphMode.FULL, False, 6),
+    ],
+)
+def test_full_decode_draft_rope_prepares_distinct_query_and_context_sources(runtime_mode, uses_fdo, context_tokens):
     assert hasattr(
         AscendSpecDecodeBaseProposer310,
         "_prepare_full_decode_draft_rope",
@@ -111,10 +122,14 @@ def test_full_decode_draft_rope_prepares_distinct_query_and_context_sources():
     proposer.method = "dflash"
     proposer.runner = SimpleNamespace(max_num_tokens=1280)
     proposer._context_positions_buffer = torch.arange(1280, dtype=torch.int32)
-    proposer._dflash_num_context = 6
+    proposer._context_slot_mapping_buffer = torch.arange(1280, dtype=torch.int32)
+    slots_ptr = proposer._context_slot_mapping_buffer.data_ptr()
+    original_slots = proposer._context_slot_mapping_buffer.clone()
+    proposer._dflash_num_context = context_tokens
     rotary = SimpleNamespace(cos_sin_cache=torch.zeros(32, 8))
     proposer.model = SimpleNamespace(modules=lambda: [rotary])
     query_positions = torch.arange(160, dtype=torch.int32)
+    proposer._get_positions = MagicMock(return_value=query_positions)
     query_cos = torch.empty(1, 1280, 1, 8)
     query_sin = torch.empty_like(query_cos)
     context_cos = torch.empty_like(query_cos)
@@ -123,7 +138,15 @@ def test_full_decode_draft_rope_prepares_distinct_query_and_context_sources():
     with (
         patch(
             "vllm_ascend._310p.spec_decode.llm_base_proposer_310.is_310p_dflash_full_decode_only",
-            return_value=True,
+            return_value=uses_fdo,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.is_310p_dflash_full_and_piecewise",
+            return_value=not uses_fdo,
+        ),
+        patch(
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.is_310p_dflash_piecewise",
+            return_value=False,
         ),
         patch(
             "vllm_ascend._310p.spec_decode.llm_base_proposer_310.AscendRotaryEmbedding310",
@@ -140,7 +163,7 @@ def test_full_decode_draft_rope_prepares_distinct_query_and_context_sources():
             query_positions=query_positions,
             query_actual_tokens=96,
             descriptor_tokens=160,
-            runtime_mode=CUDAGraphMode.FULL,
+            runtime_mode=runtime_mode,
         )
         proposer._finish_full_decode_draft_rope(prepared)
 
@@ -152,13 +175,19 @@ def test_full_decode_draft_rope_prepares_distinct_query_and_context_sources():
     assert prepare_kwargs["query_actual_tokens"] == 96
     assert prepare_kwargs["context_positions"].data_ptr() == (proposer._context_positions_buffer.data_ptr())
     assert prepare_kwargs["context_positions"].shape == (160,)
-    assert prepare_kwargs["context_actual_tokens"] == 6
+    assert prepare_kwargs["context_actual_tokens"] == context_tokens
     assert prepare_kwargs["capacity_tokens"] == 1280
     assert proposer._full_decode_draft_query_rope_cos_310 is query_cos
     assert proposer._full_decode_draft_query_rope_sin_310 is query_sin
     assert proposer._full_decode_draft_context_rope_cos_310 is context_cos
     assert proposer._full_decode_draft_context_rope_sin_310 is context_sin
     clear.assert_called_once_with()
+
+    expected_slots = original_slots.clone()
+    if uses_fdo and runtime_mode == CUDAGraphMode.FULL:
+        expected_slots[context_tokens:160] = -1
+    torch.testing.assert_close(proposer._context_slot_mapping_buffer, expected_slots)
+    assert proposer._context_slot_mapping_buffer.data_ptr() == slots_ptr
 
 
 def test_fdo_non_full_draft_refreshes_full_context_beyond_query_descriptor():
