@@ -484,6 +484,17 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
                 f"descriptor={context_descriptor_tokens}"
             )
 
+        if (
+            uses_full_decode_only
+            and runtime_mode == CUDAGraphMode.FULL
+            and context_actual_tokens < context_descriptor_tokens
+        ):
+            # FULL replay also writes padded context KV. Stale slots would
+            # overwrite valid history with padding computed at position zero.
+            self._context_slot_mapping_buffer[
+                context_actual_tokens:context_descriptor_tokens
+            ].fill_(-1)
+
         draft_rotary = getattr(self, "_full_decode_draft_rotary_310", None)
         if draft_rotary is None:
             draft_rotary = next(
