@@ -89,8 +89,7 @@ def test_hybrid_draft_step_slot_mapping_uses_persistent_gather_without_add():
 
     with (
         patch(
-            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
-            "is_310p_dflash_full_and_piecewise",
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.is_310p_dflash_full_and_piecewise",
             return_value=True,
         ),
         patch.object(torch, "add", side_effect=AssertionError("private Add is forbidden")),
@@ -123,8 +122,7 @@ def test_hybrid_draft_slot_mapping_normalizes_int64_inputs_to_int32_math():
 
     with (
         patch(
-            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
-            "is_310p_dflash_full_and_piecewise",
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.is_310p_dflash_full_and_piecewise",
             return_value=True,
         ),
         patch.object(torch, "add", side_effect=AssertionError("int64 Add is forbidden")),
@@ -410,6 +408,7 @@ def test_full_decode_draft_rope_prepares_distinct_query_and_context_sources():
     proposer.method = "dflash"
     proposer.runner = SimpleNamespace(max_num_tokens=1280)
     proposer._context_positions_buffer = torch.arange(1280, dtype=torch.int32)
+    proposer._context_slot_mapping_buffer = torch.arange(1280, dtype=torch.int32)
     proposer._dflash_num_context = 6
     rotary = SimpleNamespace(cos_sin_cache=torch.zeros(32, 8))
     proposer.model = SimpleNamespace(modules=lambda: [rotary])
@@ -532,8 +531,7 @@ def test_hybrid_full_rope_separates_target_descriptor_from_draft_capacity():
 
     with (
         patch(
-            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
-            "is_310p_dflash_full_decode_only",
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.is_310p_dflash_full_decode_only",
             return_value=False,
         ),
         patch(
@@ -541,17 +539,14 @@ def test_hybrid_full_rope_separates_target_descriptor_from_draft_capacity():
             return_value=True,
         ),
         patch(
-            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
-            "AscendRotaryEmbedding310",
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.AscendRotaryEmbedding310",
             type(rotary),
         ),
         patch(
-            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
-            "prepare_full_decode_draft_rope_310",
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.prepare_full_decode_draft_rope_310",
         ) as prepare,
         patch(
-            "vllm_ascend._310p.spec_decode.llm_base_proposer_310."
-            "get_full_decode_draft_rope_buffers_310",
+            "vllm_ascend._310p.spec_decode.llm_base_proposer_310.get_full_decode_draft_rope_buffers_310",
             return_value=(query_cos, query_sin, context_cos, context_sin),
         ),
     ):

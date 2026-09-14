@@ -54,9 +54,13 @@ from vllm_ascend._310p.ops.rotary_embedding import (
     AscendRotaryEmbedding310,
     configure_draft_rope_capacity_310,
 )
+from vllm_ascend._310p.spec_decode.dflash_mrope import build_dflash_mrope_positions
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDsparkProposer
+
+_original_dflash_init = AscendDflashProposer.__init__
+_original_dflash_raise_if_mrope = AscendDflashProposer._raise_if_mrope
 
 # The 310P recurrent GDN kernel reserves buffers for a maximum recurrent query
 # length of 16. DFlash verification prepends one target bonus token, leaving
@@ -738,6 +742,21 @@ def _copy_and_expand_inputs_ascendc(
 class AscendDflashProposer310(AscendDflashProposer):
     """310P dflash proposer: builds inputs with the AscendC op (no Triton)."""
 
+    def __init__(self, vllm_config, device, runner=None):
+        _original_dflash_init(self, vllm_config, device, runner=runner)
+        if self.uses_mrope:
+            capacity = max(self.max_num_tokens, self.max_query_tokens)
+            self.mrope_positions = torch.zeros((3, capacity + 1), dtype=torch.int32, device=device)
+            self._context_mrope_positions_buffer = torch.zeros_like(self.mrope_positions)
+            self._dflash_mrope_deltas = runner._make_buffer(self.max_batch_size, dtype=torch.int32)
+
+    def _raise_if_mrope(self):
+        # This method is bound only to the 310P DFlash proposer, not the shared
+        # upstream base or the neighboring EAGLE/DSpark implementations.
+        if self.method == "dflash" and self.draft_model_config.uses_mrope:
+            return
+        return _original_dflash_raise_if_mrope(self)
+
     def prepare_next_token_ids_padded(
         self,
         sampled_token_ids: torch.Tensor,
@@ -808,6 +827,32 @@ class AscendDflashProposer310(AscendDflashProposer):
 
         has_num_rejected = num_rejected_tokens_gpu is not None
 
+        if getattr(self, "uses_mrope", False):
+            if target_positions.ndim == 1:
+                target_positions = target_positions.unsqueeze(0).expand(3, -1)
+            if target_positions.shape != (3, num_context):
+                raise ValueError("DFlash m-RoPE context positions must match [3, num_context]")
+            self._context_mrope_positions_buffer.zero_()
+            self._context_mrope_positions_buffer[:, :num_context].copy_(target_positions)
+            deltas = self._dflash_mrope_deltas
+            for i, req_id in enumerate(self.runner.input_batch.req_ids[:batch_size]):
+                delta = self.runner.requests[req_id].mrope_position_delta
+                if delta is None and self.runner.uses_mrope:
+                    raise ValueError("DFlash m-RoPE request is missing its position delta")
+                deltas.np[i] = 0 if delta is None else delta
+            deltas.copy_to_gpu(batch_size)
+            target_positions, query_rope_positions = build_dflash_mrope_positions(
+                target_positions,
+                cad.query_start_loc,
+                cad.seq_lens[:batch_size],
+                num_rejected_tokens_gpu,
+                deltas.gpu[:batch_size],
+                num_context,
+                num_query_per_req,
+            )
+            self.mrope_positions.zero_()
+            self.mrope_positions[:, :num_query_total].copy_(query_rope_positions)
+
         token_indices_to_sample = _copy_and_expand_inputs_ascendc(
             self,
             next_token_ids=next_token_ids,
@@ -870,12 +915,20 @@ class AscendDflashProposer310(AscendDflashProposer):
         )
         self.model.precompute_and_store_context_kv(
             self._dflash_hidden_states[:num_context],
-            self._context_positions_buffer[:num_context],
+            (
+                self._context_mrope_positions_buffer[:, :num_context]
+                if getattr(self, "uses_mrope", False)
+                else self._context_positions_buffer[:num_context]
+            ),
             context_slot_mapping,
         )
         return dict(
             input_ids=self.input_ids[:num_input_tokens],
-            positions=self.positions[:num_input_tokens],
+            positions=(
+                self._get_positions(num_input_tokens)
+                if getattr(self, "uses_mrope", False)
+                else self.positions[:num_input_tokens]
+            ),
             inputs_embeds=None,
         )
 

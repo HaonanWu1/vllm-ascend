@@ -30,13 +30,30 @@ provides a 310P-safe version that:
 import torch
 import torch.nn.functional as F
 from vllm.logger import logger
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention, DFlashQwen3ForCausalLM
 
 from vllm_ascend._310p.ops.rotary_embedding import (
     AscendRotaryEmbedding310,
     set_full_decode_draft_rope_source_310,
 )
 from vllm_ascend.utils import vllm_version_is
+
+_original_dflash_attention_forward = DFlashQwen3Attention.forward
+
+
+def dflash_attention_forward_310(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    state = self.__dict__.get("_dflash_mrope_state")
+    if state is None:
+        return _original_dflash_attention_forward(self, positions, hidden_states)
+    qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
+    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    q_shape, k_shape = q.shape, k.shape
+    q = self.q_norm(q.view(*q_shape[:-1], -1, self.head_dim)).view(q_shape)
+    k = self.k_norm(k.view(*k_shape[:-1], -1, self.head_dim)).view(k_shape)
+    q, k = state.apply(q, k)
+    attn_output = self.attn(q, k, v)
+    output, _ = self.o_proj(attn_output)
+    return output
 
 
 def precompute_and_store_context_kv_310(
@@ -97,8 +114,12 @@ def precompute_and_store_context_kv_310(
                     k_norm_input=all_k[i],
                     k_norm_output=k_normed,
                 )
-            tmpv = k_normed.clone()
-            k_roped, _ = self.layers[i].self_attn.rotary_emb(context_positions, k_normed, tmpv)
+            mrope_state = self.layers[i].self_attn.__dict__.get("_dflash_mrope_state")
+            if mrope_state is not None:
+                k_roped, _ = mrope_state.apply(k_normed, k_normed, context=True)
+            else:
+                tmpv = k_normed.clone()
+                k_roped, _ = self.layers[i].self_attn.rotary_emb(context_positions, k_normed, tmpv)
             all_k_normed[i] = k_roped.reshape(num_ctx, nkv, hd)
             if context_probe is not None:
                 context_probe.capture_context_rope(

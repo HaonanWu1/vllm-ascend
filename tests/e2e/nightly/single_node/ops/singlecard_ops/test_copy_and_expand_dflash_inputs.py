@@ -212,16 +212,31 @@ def _assert_all_close(npu_out, golden_out):
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2, 4, 8, 16])
-@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 5])
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 5, 7, 15])
 @pytest.mark.parametrize("sample_from_anchor", [False, True])
 @pytest.mark.parametrize("seed_offset", [0, 1])
 def test_copy_and_expand_dflash_inputs(num_reqs, num_speculative_tokens, sample_from_anchor, seed_offset):
     rng = np.random.default_rng(SEED + seed_offset)
     case = generate_test_case(rng, num_reqs, num_speculative_tokens, sample_from_anchor)
-    golden = golden_copy_and_expand_dflash(**{k: case[k] for k in (
-        "next_token_ids", "target_positions", "context_slot_mapping", "query_start_loc",
-        "seq_lens", "block_table", "num_rejected_tokens", "parallel_drafting_token_id",
-        "block_size", "num_query_per_req", "num_speculative_tokens", "sample_from_anchor")})
+    golden = golden_copy_and_expand_dflash(
+        **{
+            k: case[k]
+            for k in (
+                "next_token_ids",
+                "target_positions",
+                "context_slot_mapping",
+                "query_start_loc",
+                "seq_lens",
+                "block_table",
+                "num_rejected_tokens",
+                "parallel_drafting_token_id",
+                "block_size",
+                "num_query_per_req",
+                "num_speculative_tokens",
+                "sample_from_anchor",
+            )
+        }
+    )
     npu_out = npu_op_exec(case)
     _assert_all_close(npu_out, golden)
 
@@ -231,10 +246,25 @@ def test_no_rejected_tokens(num_reqs):
     """DFlash decode steps with zero rejected tokens (num_rejected all 0)."""
     rng = np.random.default_rng(SEED + 400)
     case = generate_test_case(rng, num_reqs, num_speculative_tokens=3, sample_from_anchor=False, max_rejected_per_req=0)
-    golden = golden_copy_and_expand_dflash(**{k: case[k] for k in (
-        "next_token_ids", "target_positions", "context_slot_mapping", "query_start_loc",
-        "seq_lens", "block_table", "num_rejected_tokens", "parallel_drafting_token_id",
-        "block_size", "num_query_per_req", "num_speculative_tokens", "sample_from_anchor")})
+    golden = golden_copy_and_expand_dflash(
+        **{
+            k: case[k]
+            for k in (
+                "next_token_ids",
+                "target_positions",
+                "context_slot_mapping",
+                "query_start_loc",
+                "seq_lens",
+                "block_table",
+                "num_rejected_tokens",
+                "parallel_drafting_token_id",
+                "block_size",
+                "num_query_per_req",
+                "num_speculative_tokens",
+                "sample_from_anchor",
+            )
+        }
+    )
     npu_out = npu_op_exec(case)
     _assert_all_close(npu_out, golden)
 
@@ -244,13 +274,33 @@ def test_large_context(num_reqs):
     """Larger per-request context to exercise the bulk context copy path."""
     rng = np.random.default_rng(SEED + 200)
     case = generate_test_case(
-        rng, num_reqs, num_speculative_tokens=4, sample_from_anchor=False,
-        min_ctx_per_req=100, max_ctx_per_req=512, max_rejected_per_req=8,
+        rng,
+        num_reqs,
+        num_speculative_tokens=4,
+        sample_from_anchor=False,
+        min_ctx_per_req=100,
+        max_ctx_per_req=512,
+        max_rejected_per_req=8,
     )
-    golden = golden_copy_and_expand_dflash(**{k: case[k] for k in (
-        "next_token_ids", "target_positions", "context_slot_mapping", "query_start_loc",
-        "seq_lens", "block_table", "num_rejected_tokens", "parallel_drafting_token_id",
-        "block_size", "num_query_per_req", "num_speculative_tokens", "sample_from_anchor")})
+    golden = golden_copy_and_expand_dflash(
+        **{
+            k: case[k]
+            for k in (
+                "next_token_ids",
+                "target_positions",
+                "context_slot_mapping",
+                "query_start_loc",
+                "seq_lens",
+                "block_table",
+                "num_rejected_tokens",
+                "parallel_drafting_token_id",
+                "block_size",
+                "num_query_per_req",
+                "num_speculative_tokens",
+                "sample_from_anchor",
+            )
+        }
+    )
     npu_out = npu_op_exec(case)
     _assert_all_close(npu_out, golden)
 
@@ -260,11 +310,71 @@ def test_block_sizes(block_size):
     """Both supported 310P kernel block sizes."""
     rng = np.random.default_rng(SEED + 500)
     case = generate_test_case(
-        rng, num_reqs=8, num_speculative_tokens=2, sample_from_anchor=False, block_size=block_size,
+        rng,
+        num_reqs=8,
+        num_speculative_tokens=2,
+        sample_from_anchor=False,
+        block_size=block_size,
     )
-    golden = golden_copy_and_expand_dflash(**{k: case[k] for k in (
-        "next_token_ids", "target_positions", "context_slot_mapping", "query_start_loc",
-        "seq_lens", "block_table", "num_rejected_tokens", "parallel_drafting_token_id",
-        "block_size", "num_query_per_req", "num_speculative_tokens", "sample_from_anchor")})
+    golden = golden_copy_and_expand_dflash(
+        **{
+            k: case[k]
+            for k in (
+                "next_token_ids",
+                "target_positions",
+                "context_slot_mapping",
+                "query_start_loc",
+                "seq_lens",
+                "block_table",
+                "num_rejected_tokens",
+                "parallel_drafting_token_id",
+                "block_size",
+                "num_query_per_req",
+                "num_speculative_tokens",
+                "sample_from_anchor",
+            )
+        }
+    )
     npu_out = npu_op_exec(case)
     _assert_all_close(npu_out, golden)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [7, 15])
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_mrope_logical_positions_with_all_acceptance_extents(num_speculative_tokens, block_size):
+    from vllm_ascend._310p.spec_decode.dflash_mrope import build_dflash_mrope_positions
+
+    k = num_speculative_tokens
+    case = generate_test_case(
+        np.random.default_rng(SEED + 600),
+        3,
+        k,
+        False,
+        block_size=block_size,
+        min_ctx_per_req=k + 1,
+        max_ctx_per_req=k + 1,
+        max_rejected_per_req=0,
+    )
+    # Full, partial and zero draft acceptance; the target bonus remains valid.
+    case["num_rejected_tokens"] = np.array([0, k // 2, k], dtype=np.int32)
+    count = len(case["target_positions"])
+    image_positions = torch.arange(count, dtype=torch.int32).repeat(3, 1)
+    image_positions[1] //= 2
+    image_positions[2] %= 4
+    deltas = np.array([-1, -2, -3], dtype=np.int32)
+    logical, query = build_dflash_mrope_positions(
+        image_positions.npu(),
+        torch.from_numpy(case["query_start_loc"]).npu(),
+        torch.from_numpy(case["seq_lens"]).npu(),
+        torch.from_numpy(case["num_rejected_tokens"]).npu(),
+        torch.from_numpy(deltas).npu(),
+        count,
+        k + 1,
+    )
+    expected_context = np.concatenate([np.arange(s - k - 1, s, dtype=np.int32) for s in case["seq_lens"]])
+    starts = case["seq_lens"] - case["num_rejected_tokens"]
+    expected_query = np.concatenate([np.arange(max(s + d, 0), max(s + d, 0) + k + 1) for s, d in zip(starts, deltas)])
+    np.testing.assert_array_equal(logical.cpu().numpy(), expected_context)
+    np.testing.assert_array_equal(query.cpu().numpy(), np.tile(expected_query, (3, 1)))
+    case["target_positions"] = expected_context
+    _assert_all_close(npu_op_exec(case), golden_copy_and_expand_dflash(**case))
