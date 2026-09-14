@@ -1,6 +1,7 @@
 import vllm
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention, DFlashQwen3ForCausalLM, DFlashQwen3Model
+from vllm.v1.spec_decode.dflash import DFlashProposer
 
 from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
 from vllm_ascend._310p.ops.fla.idex import (
@@ -8,6 +9,7 @@ from vllm_ascend._310p.ops.fla.idex import (
     prepare_chunk_offsets_310,
 )
 from vllm_ascend._310p.spec_decode.dflash_model_310 import (
+    dflash_attention_forward_310,
     patch_dflash_read_mask_embedding_310,
     precompute_and_store_context_kv_310,
 )
@@ -16,6 +18,7 @@ from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
     AscendDsparkProposer310,
     wrap_dummy_run_with_draft_flag,
 )
+from vllm_ascend._310p.spec_decode.dflash_vocab import load_dflash_weights_310, maybe_share_dflash_lm_head_310
 from vllm_ascend._310p.spec_decode.llm_base_proposer_310 import AscendSpecDecodeBaseProposer310
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
@@ -43,6 +46,8 @@ AscendSpecDecodeBaseProposer.__init__ = (  # type: ignore[method-assign]
 AscendSpecDecodeBaseProposer.load_model = (  # type: ignore[method-assign]
     AscendSpecDecodeBaseProposer310.load_model
 )
+AscendSpecDecodeBaseProposer._maybe_share_lm_head = maybe_share_dflash_lm_head_310  # type: ignore[method-assign]
+DFlashQwen3ForCausalLM.load_weights = load_dflash_weights_310  # type: ignore[method-assign]
 
 # 310P: protect tail slot during MTP input_ids shift to avoid GatherV2 corruption
 # caused by the NPU slice-assign writing one element past the intended range
@@ -66,6 +71,12 @@ AscendSpecDecodeBaseProposer._finish_full_decode_draft_rope = (  # type: ignore[
 # 310P has no Triton, so dflash/dspark build their draft-model inputs via the
 # AscendC npu_copy_and_expand_dflash_inputs custom op instead of the Triton
 # kernel used on other platforms.
+AscendDflashProposer.__init__ = AscendDflashProposer310.__init__  # type: ignore[method-assign]
+AscendDflashProposer._raise_if_mrope = AscendDflashProposer310._raise_if_mrope  # type: ignore[method-assign]
+# GPUModelRunner.__init__ creates a temporary upstream DFlash proposer before
+# NPUModelRunner replaces it. Scope the bootstrap exception to that class too;
+# the shared speculative base (and EAGLE/DSpark) keeps its original guard.
+DFlashProposer._raise_if_mrope = AscendDflashProposer310._raise_if_mrope  # type: ignore[method-assign]
 AscendDflashProposer.set_inputs_first_pass = (  # type: ignore[method-assign]
     AscendDflashProposer310.set_inputs_first_pass
 )
@@ -113,6 +124,7 @@ for _mod in (_rejection_sampler_mod, _sampler_mod, _llm_base_proposer_mod):
 # 310P: patch_qwen3_dflash is excluded on 310P, so wire the dflash model
 # precompute (context KV + RoPE) and mask-embedding fallback here.
 DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv_310  # type: ignore[method-assign]
+DFlashQwen3Attention.forward = dflash_attention_forward_310  # type: ignore[method-assign]
 patch_dflash_read_mask_embedding_310()
 
 # Patch _warmup_prefill_kernels to no-op on 310P: triton.next_power_of_2 does
