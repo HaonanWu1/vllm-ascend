@@ -597,21 +597,32 @@ class KernelComputeWy {
                    FIXED_CHUNK_SIZE, FIXED_CHUNK_SIZE, FIXED_CHUNK_SIZE);
   }
 
-  // Stable in-place solve R = (I-A)^-1 R for a single RHS block. Processing rows
-  // top to bottom means each source row has already been solved, exactly matching
-  // the torch WY forward substitution. A and R stay fp32 until the output cast.
-  // Called once per pass (W in pass 1, U in pass 2); A is read-only here.
+  // Stable fp32 solve R = (I-A)^-1 R, with columns visited in increasing
+  // order. Once row col is solved, all later rows can consume it in parallel.
+  // Each destination still accumulates col=0..row-1 in the original order;
+  // only independent destination rows share a vector instruction.
+  // The source row is outside the destination range in every repeat.
   __aicore__ inline void Fp32ForwardSubstitution(const LocalTensor<float> a, LocalTensor<float> r, uint32_t dim,
-                                                 uint32_t lda) const {
-    SyncEvent<HardEvent::V_S>(HardEvent::V_S);
-    for (uint32_t row = 1; row < FIXED_CHUNK_SIZE; ++row) {
-      const uint32_t aRowOffset = row * FIXED_CHUNK_SIZE;
-      const uint32_t rRowOffset = row * lda;
-      for (uint32_t col = 0; col < row; ++col) {
-        const float coefficient = a.GetValue(aRowOffset + col);
-        Axpy(r[rRowOffset], r[col * lda], coefficient, static_cast<int32_t>(dim));
-        PipeBarrier<PIPE_V>();
+                                                 uint32_t lda, LocalTensor<float> coefficients,
+                                                 LocalTensor<float> broadcastScratch) {
+    const BinaryRepeatParams params{1, 1, 0,
+        static_cast<uint8_t>(lda / FLOAT_PER_BLOCK), 0, 1};
+    for (uint32_t col = 0; col + 1 < FIXED_CHUNK_SIZE; ++col) {
+      Gather(coefficients, a, lane0OffBuf_.Get<uint32_t>(),
+             col * static_cast<uint32_t>(sizeof(float)), FIXED_CHUNK_SIZE);
+      PipeBarrier<PIPE_V>();
+      Brcb(broadcastScratch, coefficients, FIXED_CHUNK_SIZE / FLOAT_PER_BLOCK,
+           {1, static_cast<uint16_t>(FLOAT_PER_BLOCK)});
+      PipeBarrier<PIPE_V>();
+      const uint8_t rows = static_cast<uint8_t>(FIXED_CHUNK_SIZE - col - 1);
+      for (uint32_t offset = 0; offset < dim; offset += FLOAT_VEC_LEN) {
+        MulAddDst(r[(col + 1) * lda + offset], r[col * lda + offset],
+                  broadcastScratch[(col + 1) * FLOAT_PER_BLOCK],
+                  static_cast<uint64_t>(FLOAT_VEC_LEN), rows, params);
       }
+      // All updates finish before the next newly solved row is consumed,
+      // and before the coefficient/broadcast buffers are reused.
+      PipeBarrier<PIPE_V>();
     }
   }
 
@@ -686,7 +697,7 @@ class KernelComputeWy {
 
     // ---- W = T @ (γβK), resident in rhs. halfLocal stages R halves. ----
     if (useFp32ForwardSubstitution) {
-      Fp32ForwardSubstitution(attnLocal, rhs, kHeadDim_, alignK_);
+      Fp32ForwardSubstitution(attnLocal, rhs, kHeadDim_, alignK_, expGLocal, scratch);
     } else {
       ApplyTCompensated(rhs, qHalf[ATTEN_ELEMS], qHalf, halfLocal,
                         halfLocal[ATTEN_ELEMS], scratch, kHeadDim_, alignK_);
@@ -706,7 +717,7 @@ class KernelComputeWy {
     BroadcastMulRowsFloat(rhs, rhs, betaLocal, scratch, FIXED_CHUNK_SIZE,
                           vHeadDim_, alignV_, alignV_);
     if (useFp32ForwardSubstitution) {
-      Fp32ForwardSubstitution(attnLocal, rhs, vHeadDim_, alignV_);
+      Fp32ForwardSubstitution(attnLocal, rhs, vHeadDim_, alignV_, expGLocal, scratch);
       // storeBuf may still be feeding the W store (MTE3 reads) — order the U cast.
       SyncEvent<HardEvent::MTE3_V>(HardEvent::MTE3_V);
       Cast(storeLocal, rhs, RoundMode::CAST_NONE, chunkVElems_);
