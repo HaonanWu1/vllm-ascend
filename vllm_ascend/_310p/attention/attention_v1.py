@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
     register_backend,
@@ -41,6 +42,7 @@ from vllm_ascend._310p.dflash_full_and_piecewise import (
     is_310p_dflash_effective_piecewise,
     is_310p_dflash_full_and_piecewise,
 )
+from vllm_ascend._310p.dflash_full_decode_only import is_310p_dflash_full_decode_only
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_forward_context
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -52,6 +54,10 @@ from vllm_ascend.attention.attention_v1 import (
 
 MASK_TYPE_NORM_COMPRESS_SELF_ATTENTION = 3
 MASK_TYPE_NORM_COMPRESS_PAGED_ATTENTION = 5
+HEAD_FOLD_QUERY_LEN = 8
+HEAD_FOLD_TOKEN_COUNT = 80
+HEAD_FOLD_GQA_RATIOS = (4, 8)
+HEAD_FOLD_HEAD_SIZES = (128, 256)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -286,6 +292,31 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         mask = attn_metadata.attn_mask
         return self._flash_attention(query, key, value, mask, seq_len, output)
 
+    def _splitfuse_head_fold_factor(self, query, output, runtime_mode):
+        """Limit head folding to the validated K7 FDO decode contract.
+
+        This changes the operator's row/head presentation, not the model's
+        token count, KV-cache layout, attention scale, or graph descriptor.
+        Other speculative lengths and execution modes retain the original path.
+        """
+        if (
+            runtime_mode != CUDAGraphMode.FULL
+            or not is_310p_dflash_full_decode_only(self.vllm_config)
+            or self.vllm_config.speculative_config.num_speculative_tokens + 1 != HEAD_FOLD_QUERY_LEN
+            or query.ndim != 3
+            or query.shape[0] != HEAD_FOLD_TOKEN_COUNT
+            or query.shape[1] != self.num_heads
+            or query.dtype != torch.float16
+            or not query.is_contiguous()
+            or not output.is_contiguous()
+            or self.num_kv_heads <= 0
+            or self.num_heads % self.num_kv_heads
+            or query.shape[-1] not in HEAD_FOLD_HEAD_SIZES
+        ):
+            return 1
+        ratio = self.num_heads // self.num_kv_heads
+        return ratio if ratio in HEAD_FOLD_GQA_RATIOS else 1
+
     def forward_chunked_prefill_310(self, query, attn_metadata, output):
         """
         Executes SplitFuse (Chunked Prefill) attention on 310P.
@@ -299,9 +330,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             attn_metadata (AscendMetadata): Metadata containing start locations and block tables.
             output: The output tensor.
         """
-        private_draft_inputs = (
-            get_dflash_hybrid_draft_attention_inputs_310(attn_metadata)
-        )
+        private_draft_inputs = get_dflash_hybrid_draft_attention_inputs_310(attn_metadata)
         try:
             runtime_mode = get_forward_context().cudagraph_runtime_mode
         except (AssertionError, RuntimeError):
@@ -372,11 +401,34 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             )
             return output
 
+        # Same-KV query heads are independent rows with identical visibility.
+        # Folding fills the small Cube M dimension without copying the KV cache.
+        fold = self._splitfuse_head_fold_factor(query, output_slice, runtime_mode)
+        original_tokens = query.shape[0]
+        folded_heads = self.num_heads // fold
+        if fold != 1:
+            query = query.view(original_tokens, folded_heads, fold, query.shape[-1])
+            query = query.transpose(1, 2).reshape(original_tokens * fold, folded_heads, query.shape[-1]).contiguous()
+            # Host qLens is descriptor-constant for uniform FULL decode; this
+            # operation is performed at capture, with no device synchronization.
+            qlens = (qlens * fold).pin_memory()
+            if folded_heads == 1:
+                folded_output = output_slice.view(original_tokens * fold, folded_heads, output_slice.shape[-1])
+            else:
+                folded_output = torch.empty_like(query)
+            # ATB's folded layout can skip writing zero-context descriptor
+            # slots. Never let stale outputs from an earlier replay escape.
+            folded_output.zero_()
+        else:
+            folded_output = output_slice
+
         # Generate the specific mask for splitfuse
         if attn_metadata.causal:
-            mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
+            mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device, query_head_repeat=fold)
         else:
-            mask = AttentionMaskBuilder310.get_non_causal_splitfuse_mask(attn_metadata, query.device)
+            mask = AttentionMaskBuilder310.get_non_causal_splitfuse_mask(
+                attn_metadata, query.device, query_head_repeat=fold
+            )
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
             key_cache=self.key_cache,
@@ -386,10 +438,15 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             seq_len=qlens,
             context_lens=attn_metadata.seq_lens,
             num_kv_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
+            num_heads=folded_heads,
             scale_value=self.scale,
-            out=output_slice,
+            out=folded_output,
         )
+
+        if fold != 1 and folded_heads != 1:
+            restored = folded_output.view(original_tokens, fold, folded_heads, output_slice.shape[-1])
+            output_view = output_slice.view(original_tokens, folded_heads, fold, output_slice.shape[-1])
+            output_view.copy_(restored.transpose(1, 2))
 
         return output
 
