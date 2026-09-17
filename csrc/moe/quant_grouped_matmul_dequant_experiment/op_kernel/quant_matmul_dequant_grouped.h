@@ -41,12 +41,45 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
     GlobalTensor<float> xScaleGm0 = xScaleGm;
     GlobalTensor<half> yGm0 = yGm;
     FirstTiling();
+    // Diagnostic candidate: split cores between independent small experts and
+    // their N tiles. Large experts retain the original all-core synchronized
+    // path in a second pass. No expert's reduction/rounding order is changed.
+    const bool gateUpShape = tilingData->originK == DECODE_HIDDEN_SIZE &&
+        tilingData->originN == DECODE_GATE_UP_SIZE;
+    const bool downShape = tilingData->originK == DECODE_INTERMEDIATE_SIZE &&
+        tilingData->originN == DECODE_HIDDEN_SIZE;
+    const uint32_t expertShards = gateUpShape ? DECODE_EXPERT_SHARDS : DECODE_DOWN_EXPERT_SHARDS;
+    const bool shardSmallExperts = tilingData->originE == DECODE_EXPERTS &&
+        tilingData->originM == DECODE_ROUTED_ROWS && (gateUpShape || downShape) &&
+        tilingData->CoreNum == DECODE_CORES &&
+        gemv_threshold == GEMV_THRESHOLD && tilingData->perToken &&
+        !tilingData->dynamicQuant && !tilingData->smoothScale && !isWScaleInt64;
+    const uint32_t coresPerExpert = DECODE_CORES / expertShards;
+    for (uint32_t phase = 0; phase < (shardSmallExperts ? 2U : 1U); ++phase) {
+    startM = 0;
+    uint32_t smallExpertOrdinal = 0;
     for(int32_t i = 0; i < tilingData->originE; i++) {
-      if(startM >= tilingData->originM) return;
+      if(startM >= tilingData->originM) {
+        if (!shardSmallExperts) return;
+        break;
+      }
       endM = groupGM.GetValue(i);
       if(endM > tilingData->originM) endM = tilingData->originM;
       realM = endM - startM;
       if(realM==0){continue;}
+      if (shardSmallExperts) {
+        const bool smallExpert = realM <= gemv_threshold &&
+            tilingData->originKAligned512 * realM <= L1_SIZE / NUMBER_2;
+        // Down routes may have sparse expert IDs concentrated in one residue.
+        // Cycle over active small experts, not IDs; every core sees the same
+        // ordinal. Gate/up retains its already validated ownership unchanged.
+        const uint32_t ownerIndex = downShape && smallExpert ? smallExpertOrdinal++ : i;
+        if ((phase == 0 && (!smallExpert || ownerIndex % expertShards != block_id / coresPerExpert)) ||
+            (phase == 1 && smallExpert)) {
+          startM = endM;
+          continue;
+        }
+      }
 
       xGm = xGm0[(uint64_t)startM * (tilingData->originK)];
       quantizedWeightGm = quantizedWeightGm0[(uint64_t)i * (tilingData->fracK) * (tilingData->fracN) * NM_FRACTAL_INT8 * K_FRACTAL_INT8];
@@ -74,7 +107,8 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
         QuantMatmulDequantNormal::ProcessMM();
         MySyncAllSwift();
       } else {
-        if(realsingleCoreFracN == 0) {
+        const uint32_t currentCoreFracN = shardSmallExperts ? tilingData->fracN / coresPerExpert : realsingleCoreFracN;
+        if(currentCoreFracN == 0) {
           if(tilingData->dynamicQuant) MySyncAllSwift();
           continue;
         }
@@ -82,9 +116,10 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
 
         QuantMatmulDequantGemv::ProcessX();
 
-        uint32_t iterNL0C = (realsingleCoreFracN + baseFracNL0C - 1) / baseFracNL0C;
-        uint32_t baseFracNL0CTail = (realsingleCoreFracN - 1) % baseFracNL0C + 1;
-        uint32_t offsetFracN = tilingData->singleCoreFracN * block_id - (block_id > tilingData->singleCoreFracNTail ? (block_id - tilingData->singleCoreFracNTail) : 0);
+        uint32_t iterNL0C = (currentCoreFracN + baseFracNL0C - 1) / baseFracNL0C;
+        uint32_t baseFracNL0CTail = (currentCoreFracN - 1) % baseFracNL0C + 1;
+        uint32_t offsetFracN = shardSmallExperts ? (block_id % coresPerExpert) * currentCoreFracN :
+            tilingData->singleCoreFracN * block_id - (block_id > tilingData->singleCoreFracNTail ? (block_id - tilingData->singleCoreFracNTail) : 0);
         for(int32_t j=0;j<iterNL0C;j++){
           uint32_t realBaseFracNL0C = (j != (iterNL0C - 1)) ? baseFracNL0C : baseFracNL0CTail;
           QuantMatmulDequantGemv::ProcessMM(realBaseFracNL0C, offsetFracN);
@@ -95,6 +130,7 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
         WaitFlag<HardEvent::MTE3_MTE2>(eventIdMTE3ToMTE2[0]);
         if(tilingData->dynamicQuant) MySyncAllSwift();
       }
+    }
     }
     PipeBarrier<PIPE_ALL>();
   }
@@ -123,6 +159,10 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
     isSwift = true;
   }
  protected:
+  static constexpr uint32_t DECODE_CORES = 8;
+  static constexpr uint32_t DECODE_EXPERT_SHARDS = 4;
+  // Private down-projection sweep. Gate/up keeps its validated four groups.
+  static constexpr uint32_t DECODE_DOWN_EXPERT_SHARDS = 4;
   __aicore__ inline void InitGlobalTensors(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_scale, GM_ADDR group_list, GM_ADDR bias,
                                            GM_ADDR x_scale, GM_ADDR x_offset, GM_ADDR smooth_scale, GM_ADDR y, GM_ADDR usrWorkspace) {
     groupGM.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(group_list), tilingData->originE);
