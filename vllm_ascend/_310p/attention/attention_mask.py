@@ -211,7 +211,43 @@ class AttentionMaskBuilder310:
         return torch.tensor(rows, dtype=torch.int32, device=device)
 
     @classmethod
-    def get_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device):
+    def _forward_mask_cache(cls, attn_metadata, device, causal, query_head_repeat=1):
+        """Share mask preparation only inside one exact FDO FULL forward.
+
+        A capture records the producer once and every graph replay executes it
+        again using the updated device metadata. Nothing is cached across
+        forwards, graph descriptors, target/draft contexts, or PIECEWISE graphs.
+        Metadata is read-only for the duration of a model forward.
+        """
+        try:
+            context = get_forward_context()
+        except (AssertionError, RuntimeError):
+            return None, None
+        config = getattr(context, "vllm_config", None)
+        if (
+            config is None
+            or context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+            or not is_310p_dflash_full_decode_only(config)
+        ):
+            return None, None
+        cache = getattr(context, "splitfuse_mask_cache_310", None)
+        if cache is None:
+            cache = {}
+            context.splitfuse_mask_cache_310 = cache
+        key = (
+            id(attn_metadata),
+            id(attn_metadata.query_start_loc),
+            id(attn_metadata.seq_lens),
+            int(attn_metadata.num_actual_tokens),
+            str(device),
+            causal,
+            cls.max_seqlen,
+            query_head_repeat,
+        )
+        return cache, key
+
+    @classmethod
+    def get_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device, query_head_repeat: int = 1):
         """
         Generates and formats the attention mask for SplitFuse (chunked prefill) decoding.
 
@@ -226,15 +262,27 @@ class AttentionMaskBuilder310:
         Returns:
             torch.Tensor: The splitfuse attention mask cast to ACL_FORMAT_FRACTAL_NZ.
         """
+        cache, key = cls._forward_mask_cache(attn_metadata, device, causal=True, query_head_repeat=query_head_repeat)
+        if cache is not None and key in cache:
+            return cache[key][1]
         if cls.chunked_prefill_attn_mask is None:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
         position = cls._get_query_positions(attn_metadata, device, causal=True)
+        if query_head_repeat != 1:
+            # Fold independent GQA heads into query rows. Repeat row indices
+            # before gathering, avoiding a costly conversion/repeat of NZ masks.
+            position = position[:, None].expand(-1, query_head_repeat).reshape(-1)
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
         splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+        if cache is not None:
+            # Retain metadata to prevent identity reuse within this context.
+            cache[key] = (attn_metadata, splitfuse_mask_nz)
         return splitfuse_mask_nz
 
     @classmethod
-    def get_non_causal_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device):
+    def get_non_causal_splitfuse_mask(
+        cls, attn_metadata: AscendMetadata, device: torch.device, query_head_repeat: int = 1
+    ):
         """SplitFuse mask for full / non-causal attention (dflash/dspark draft).
 
         Every query token must attend to the entire valid sequence ``[0, cl)``
@@ -249,11 +297,18 @@ class AttentionMaskBuilder310:
         attention over the valid sequence with the garbage tail masked. This
         mirrors ``get_splitfuse_mask`` so the operator accepts it.
         """
+        cache, key = cls._forward_mask_cache(attn_metadata, device, causal=False, query_head_repeat=query_head_repeat)
+        if cache is not None and key in cache:
+            return cache[key][1]
         if cls.chunked_prefill_attn_mask is None:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
         position = cls._get_query_positions(attn_metadata, device, causal=False)
+        if query_head_repeat != 1:
+            position = position[:, None].expand(-1, query_head_repeat).reshape(-1)
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
         splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+        if cache is not None:
+            cache[key] = (attn_metadata, splitfuse_mask_nz)
         return splitfuse_mask_nz
 
     @classmethod
