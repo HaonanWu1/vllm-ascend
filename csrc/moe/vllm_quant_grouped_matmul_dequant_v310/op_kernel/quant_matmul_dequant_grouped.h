@@ -40,10 +40,11 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
     GlobalTensor<int64_t> wScaleGmInt64_0 = wScaleGmInt64;
     GlobalTensor<float> xScaleGm0 = xScaleGm;
     GlobalTensor<half> yGm0 = yGm;
+    GlobalTensor<int8_t> xZNGm0 = xZNGM;
     FirstTiling();
-    // Diagnostic candidate: split cores between independent small experts and
-    // their N tiles. Large experts retain the original all-core synchronized
-    // path in a second pass. No expert's reduction/rounding order is changed.
+    // Process small experts, independent 9-80 row experts, then the remaining
+    // shared experts. Non-target contracts retain the original shared path.
+    // No expert's reduction or rounding order is changed.
     const bool gateUpShape = tilingData->originK == DECODE_HIDDEN_SIZE &&
         tilingData->originN == DECODE_GATE_UP_SIZE;
     const bool downShape = tilingData->originK == DECODE_INTERMEDIATE_SIZE &&
@@ -55,9 +56,12 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
         gemv_threshold == GEMV_THRESHOLD && tilingData->perToken &&
         !tilingData->dynamicQuant && !tilingData->smoothScale && !isWScaleInt64;
     const uint32_t coresPerExpert = DECODE_CORES / expertShards;
-    for (uint32_t phase = 0; phase < (shardSmallExperts ? 2U : 1U); ++phase) {
+    const bool independentLargeEnabled = shardSmallExperts && !isSwift;
+    const uint32_t phaseCount = independentLargeEnabled ? 3U : shardSmallExperts ? 2U : 1U;
+    for (uint32_t phase = 0; phase < phaseCount; ++phase) {
     startM = 0;
     uint32_t smallExpertOrdinal = 0;
+    uint32_t independentExpertOrdinal = 0;
     for(int32_t i = 0; i < tilingData->originE; i++) {
       if(startM >= tilingData->originM) {
         if (!shardSmallExperts) return;
@@ -74,8 +78,11 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
         // Cycle over active small experts, not IDs; every core sees the same
         // ordinal. Gate/up retains its already validated ownership unchanged.
         const uint32_t ownerIndex = downShape && smallExpert ? smallExpertOrdinal++ : i;
+        const bool independentExpert = independentLargeEnabled && !smallExpert && realM <= INDEPENDENT_EXPERT_ROWS;
+        const uint32_t independentOwner = independentExpert ? independentExpertOrdinal++ : 0;
         if ((phase == 0 && (!smallExpert || ownerIndex % expertShards != block_id / coresPerExpert)) ||
-            (phase == 1 && smallExpert)) {
+            (phase == 1 && (independentLargeEnabled ? (!independentExpert || independentOwner % DECODE_CORES != block_id) : smallExpert)) ||
+            (phase == 2 && (smallExpert || independentExpert))) {
           startM = endM;
           continue;
         }
@@ -96,16 +103,35 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
 
       startM = endM;
       if(realM > gemv_threshold || (tilingData->originKAligned512 * realM) > (L1_SIZE / NUMBER_2)){
+        const bool independentExpert = independentLargeEnabled && phase == 1;
+        const uint32_t physicalCore = block_id;
+        if (independentExpert) {
+          // Existing 640-row workspace is partitioned into eight disjoint
+          // 80-row NZ slots. This core alone prepares and consumes its expert.
+          xZNGM = xZNGm0[(uint64_t)physicalCore * INDEPENDENT_EXPERT_ROWS * tilingData->originKAligned32];
+          block_id = 0;
+        }
         if(!isSwift){
-          TilingInKernelNormal();
+          TilingInKernelNormal(independentExpert);
         } else{
           TilingInKernelSwift();
         }
         QuantMatmulDequantNormal::ProcessX();
-        MySyncAllSwift();
+        if (independentExpert) {
+          SetFlag<HardEvent::MTE3_MTE2>(eventIdMTE3ToMTE2[0]);
+          WaitFlag<HardEvent::MTE3_MTE2>(eventIdMTE3ToMTE2[0]);
+        } else {
+          MySyncAllSwift();
+        }
 
         QuantMatmulDequantNormal::ProcessMM();
-        MySyncAllSwift();
+        if (independentExpert) {
+          PipeBarrier<PIPE_ALL>();
+          block_id = physicalCore;
+          xZNGM = xZNGm0;
+        } else {
+          MySyncAllSwift();
+        }
       } else {
         const uint32_t currentCoreFracN = shardSmallExperts ? tilingData->fracN / coresPerExpert : realsingleCoreFracN;
         if(currentCoreFracN == 0) {
@@ -131,6 +157,8 @@ class QuantMatmulDequantGrouped : public QuantMatmulDequantNormal {
         if(tilingData->dynamicQuant) MySyncAllSwift();
       }
     }
+    // Drain disjoint slots before phase 2 reuses the shared workspace.
+    if (independentLargeEnabled && phase == 1) MySyncAllSwift();
     }
     PipeBarrier<PIPE_ALL>();
   }
@@ -160,8 +188,9 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
   }
  protected:
   static constexpr uint32_t DECODE_CORES = 8;
+  static constexpr uint32_t INDEPENDENT_EXPERT_ROWS = DECODE_ROUTED_ROWS / DECODE_CORES;
   static constexpr uint32_t DECODE_EXPERT_SHARDS = 4;
-  // Private down-projection sweep. Gate/up keeps its validated four groups.
+  // Down and gate/up both use four groups, with different expert ownership.
   static constexpr uint32_t DECODE_DOWN_EXPERT_SHARDS = 4;
   __aicore__ inline void InitGlobalTensors(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_scale, GM_ADDR group_list, GM_ADDR bias,
                                            GM_ADDR x_scale, GM_ADDR x_offset, GM_ADDR smooth_scale, GM_ADDR y, GM_ADDR usrWorkspace) {
@@ -251,13 +280,14 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
     }
   }
 
-  __aicore__ inline void TilingInKernelNormal() {
+  __aicore__ inline void TilingInKernelNormal(bool singleCoreExpert = false) {
     //x:quantize and ND->ZN
     fracM = (realM + NM_FRACTAL_INT8 - 1) / NM_FRACTAL_INT8;
     tailM = (realM - 1) % NM_FRACTAL_INT8 + 1;
     processXKloopPerfracM = (tilingData->originKAligned32 + tilingData->processXKBaseNMax - 1) / tilingData->processXKBaseNMax;
-    processXKloop = (fracM * processXKloopPerfracM + tilingData->CoreNum - 1 ) / tilingData->CoreNum;
-    processXKloopPerfracM = processXKloop * tilingData->CoreNum / fracM;
+    const uint32_t prepareCores = singleCoreExpert ? 1 : tilingData->CoreNum;
+    processXKloop = (fracM * processXKloopPerfracM + prepareCores - 1 ) / prepareCores;
+    processXKloopPerfracM = processXKloop * prepareCores / fracM;
     processXKBaseN = (tilingData->fracK + processXKloopPerfracM - 1) / processXKloopPerfracM * K_FRACTAL_INT8;
     processXKTailN = tilingData->fracK % processXKloopPerfracM;
     processXKTailN = processXKTailN == 0 ? processXKloopPerfracM : processXKTailN;
@@ -274,6 +304,10 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
     }
     MCoreNum = 1 << (NUMBER_3-chosen);
     NCoreNum = 1 << chosen;
+    if (singleCoreExpert) {
+      MCoreNum = 1;
+      NCoreNum = 1;
+    }
     int32_t singleCoreM = (fracM + MCoreNum - 1) / MCoreNum;
     int32_t singleCoreN = (tilingData->fracN + NCoreNum - 1) / NCoreNum;
     int32_t singleCoreMTail = (fracM-1) % MCoreNum + 1;

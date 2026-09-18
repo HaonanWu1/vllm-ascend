@@ -84,6 +84,7 @@ class GDNSpecCausalConv1dMetadata:
 class GDNPrefillMetadata:
     causal_conv1d: GDNCausalConv1dMetadata
     chunk: GDNChunkedPrefillMetadata
+    query_start_loc_host: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -300,6 +301,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata: GDNAttentionMetadata,
         chunk_metadata: GDNChunkedPrefillMetadata | None,
         non_spec_cache_indices: torch.Tensor | None,
+        non_spec_query_start_loc_host: tuple[int, ...] | None,
     ) -> GDNAttentionMetadata:
         attn_metadata.non_spec_prefill_metadata = None
         if attn_metadata.num_prefills <= 0:
@@ -329,6 +331,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 initial_state_mode=initial_state_mode,
             ),
             chunk=chunk_metadata,
+            query_start_loc_host=non_spec_query_start_loc_host,
         )
         return attn_metadata
 
@@ -752,6 +755,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             attn_metadata,
             non_spec_chunked_prefill_metadata,
             non_spec_conv1d_cache_indices,
+            None
+            if non_spec_query_start_loc_cpu is None
+            else tuple(non_spec_query_start_loc_cpu.to(torch.int64).reshape(-1).tolist()),
         )
         attn_metadata = self._attach_spec_decode_metadata(
             attn_metadata,

@@ -284,10 +284,20 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
   }
 
   __aicore__ inline void ProcessMM(uint32_t realBaseFracNL0C, uint32_t offsetFracN) {
-    uint32_t iterK = (tilingData->fracK + tilingData->baseFracK - 1) / tilingData->baseFracK;
-    uint32_t iterN = (realBaseFracNL0C + tilingData->baseFracN - 1) / tilingData->baseFracN;
-    uint32_t baseFracNTail = (realBaseFracNL0C - 1) % tilingData->baseFracN + 1;
-    uint32_t baseFracKTail = (tilingData->fracK - 1) % tilingData->baseFracK + 1;
+    // Keep the 32 KiB L0B slot, but widen each contiguous N transfer:
+    // 256 K x 128 N. L0A rows retain their existing 512-byte stride.
+    const bool useWideWeightTile = tilingData->originE == DECODE_EXPERTS &&
+        tilingData->originM == DECODE_ROUTED_ROWS && (tilingData->originK == DECODE_INTERMEDIATE_SIZE && tilingData->originN == DECODE_HIDDEN_SIZE) &&
+        tilingData->CoreNum == DECODE_CORE_COUNT && realM <= GEMV_THRESHOLD && tilingData->perToken &&
+        !tilingData->dynamicQuant && !tilingData->smoothScale && !isWScaleInt64;
+    constexpr uint32_t WIDE_WEIGHT_FRAC_K = 8;
+    constexpr uint32_t WIDE_WEIGHT_FRAC_N = 8;
+    const uint32_t weightFracK = useWideWeightTile ? WIDE_WEIGHT_FRAC_K : tilingData->baseFracK;
+    const uint32_t weightFracN = useWideWeightTile ? WIDE_WEIGHT_FRAC_N : tilingData->baseFracN;
+    uint32_t iterK = (tilingData->fracK + weightFracK - 1) / weightFracK;
+    uint32_t iterN = (realBaseFracNL0C + weightFracN - 1) / weightFracN;
+    uint32_t baseFracNTail = (realBaseFracNL0C - 1) % weightFracN + 1;
+    uint32_t baseFracKTail = (tilingData->fracK - 1) % weightFracK + 1;
     uint32_t offsetFracK = 0;
     DataCopyParams repeatParamsInt8;
     LoadData2dParams loadData2DA, loadData2DB;
@@ -305,7 +315,7 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
     SetFlag<HardEvent::M_MTE1>(eventIdMToMTE1[1]);
     SetFlag<HardEvent::M_MTE1>(eventIdMToMTE1[NUMBER_2]);
     for(int32_t i = 0; i < iterK; i++) {
-      uint32_t realBaseFracK = (i != (iterK - 1)) ? tilingData->baseFracK : baseFracKTail;
+      uint32_t realBaseFracK = (i != (iterK - 1)) ? weightFracK : baseFracKTail;
       mmadParams.k = realBaseFracK * K_FRACTAL_INT8;
       uint32_t offsetFracN_ = offsetFracN;
       WaitFlag<HardEvent::M_MTE1>(eventIdMToMTE1[NUMBER_2]);
@@ -314,7 +324,7 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
       WaitFlag<HardEvent::MTE1_M>(eventIdMTE1ToM[NUMBER_2]);
       for(int32_t j = 0 ; j < iterN; j++) {
         uint32_t pingpong = j % NUMBER_2;
-        uint32_t realBaseFracN = (j != (iterN - 1)) ? tilingData->baseFracN : baseFracNTail;
+        uint32_t realBaseFracN = (j != (iterN - 1)) ? weightFracN : baseFracNTail;
         mmadParams.n = realBaseFracN * NM_FRACTAL_INT8;
         repeatParamsInt8.blockCount = realBaseFracK;
         repeatParamsInt8.blockLen = realBaseFracN * L0_ADDR_ALIGN / INT8_PERBLOCK;
@@ -432,6 +442,7 @@ __aicore__ inline void Init(GM_ADDR x, GM_ADDR quantized_weight, GM_ADDR weight_
   LocalTensor<float> ubWScaleGemv;
 
   static constexpr uint32_t DECODE_EXPERTS = 256;
+  static constexpr uint32_t DECODE_CORE_COUNT = 8;
   static constexpr uint32_t DECODE_ROUTED_ROWS = 640;
   static constexpr uint32_t DECODE_HIDDEN_SIZE = 2048;
   static constexpr uint32_t DECODE_GATE_UP_SIZE = 512;

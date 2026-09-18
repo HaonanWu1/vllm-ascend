@@ -88,13 +88,16 @@ def _flatten_state_indices(
     if ssm_state_indices.ndim == 1:
         return ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
 
-    num_seqs = (cu_seqlens[1:] - cu_seqlens[:-1]).shape[0]
-    seq_lens = cu_seqlens[1 : num_seqs + 1] - cu_seqlens[:num_seqs]
+    num_seqs = cu_seqlens.shape[0] - 1
     ssm_state_indices = ssm_state_indices[:num_seqs]
 
     # Uniform spec-decode ACL graph uses fixed q_len per request; reshape avoids
     # NPU masked_select which breaks stream capture (aclnnMaskedSelect / 107027).
-    if _EXTRA_CTX.capturing or (seq_lens.numel() > 0 and torch.all(seq_lens == seq_lens[0])):
+    uniform = _EXTRA_CTX.capturing
+    if not uniform:
+        seq_lens = cu_seqlens[1 : num_seqs + 1] - cu_seqlens[:num_seqs]
+        uniform = seq_lens.numel() > 0 and torch.all(seq_lens == seq_lens[0])
+    if uniform:
         q_per_seq = ssm_state_indices.shape[1]
         flat = ssm_state_indices[:, :q_per_seq].reshape(-1)
         return flat[:total_tokens].to(torch.int32).contiguous()
@@ -206,6 +209,26 @@ def _merge_spec_and_non_spec_outputs_310(
     out[non_spec_token_indx] = non_spec_out
 
 
+def _rearrange_mixed_qkv_310(self, mixed_qkv: torch.Tensor | None):
+    """Materialize Q/K/V separately without a second concatenation copy.
+
+    The upstream concatenate is meant for Triton fusion. On 310P, the three
+    materializations and concatenation are separate kernels. Consumers only
+    require contiguous tensors, not a shared backing allocation.
+    """
+    if mixed_qkv is None:
+        return None, None, None
+    seq_len = mixed_qkv.shape[0]
+    q_dim = self.key_dim // self.tp_size
+    v_dim = self.value_dim // self.tp_size
+    query, key, value = torch.split(mixed_qkv, [q_dim, q_dim, v_dim], dim=-1)
+    return (
+        query.contiguous().view(1, seq_len, q_dim // self.head_k_dim, self.head_k_dim),
+        key.contiguous().view(1, seq_len, q_dim // self.head_k_dim, self.head_k_dim),
+        value.contiguous().view(1, seq_len, v_dim // self.head_v_dim, self.head_v_dim),
+    )
+
+
 class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
     get_state_dtype = _310p_get_state_dtype
 
@@ -249,6 +272,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        non_spec_prefill_metadata = getattr(attn_metadata, "non_spec_prefill_metadata", None)
         self_kv_cache = self.kv_cache
         conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
@@ -333,8 +357,8 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             )
         else:
             mixed_qkv_non_spec = None
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        query_spec, key_spec, value_spec = _rearrange_mixed_qkv_310(self, mixed_qkv_spec)
+        query_non_spec, key_non_spec, value_non_spec = _rearrange_mixed_qkv_310(self, mixed_qkv_non_spec)
 
         g, beta = fused_gdn_gating_pytorch(self.A_log, a, b, self.dt_bias)
         if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
@@ -376,6 +400,8 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
             # 2.2: Process the remaining part
             if attn_metadata.num_prefills > 0:
+                if non_spec_prefill_metadata is None:
+                    raise RuntimeError("Expected non-spec prefill metadata for the 310P chunk GDN path.")
                 initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
                 initial_state = _clear_states_without_initial(initial_state, has_initial_state)
                 (
@@ -392,6 +418,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
+                    cu_seqlens_host=non_spec_prefill_metadata.query_start_loc_host,
                 )
 
                 # Init cache

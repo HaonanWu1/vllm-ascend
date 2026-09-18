@@ -27,6 +27,10 @@ constexpr uint32_t MAX_OUT_BUFFER_NUM = 2;
 // tokens. Supporting up to fifteen speculative tokens therefore requires
 // room for a sixteen-token recurrent sequence.
 constexpr uint64_t MAX_MTP = 16;
+constexpr uint32_t SHORT_SEQUENCE_CAPACITY = 8;
+constexpr uint32_t FULL_STATE_TILE_DIM = 128;
+constexpr uint32_t UB_RESERVE_BYTES = 128;
+constexpr uint32_t STATE_BANK_PADDING_BYTES = 128;
 constexpr uint64_t BF16_NUM_PER_BLOCK = 16;
 constexpr uint64_t FP32_NUM_PER_BLOCK = 8;
 constexpr uint32_t REPEAT_LENTH = 64; // 256Byte for float
@@ -205,6 +209,8 @@ public:
         useAddFoldReduce_ = (RGDR_ENABLE_ADD_FOLD_REDUCE != 0);
         vStep_ = tilingData->vStep;
         restUbSize_ = tilingData->ubRestBytes;
+        ubSize_ = tilingData->ubCalSize;
+        sequenceCapacity_ = MAX_MTP;
         alignK_ = Ceil(tilingData->dk, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         alignV_ = Ceil(tilingData->dv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         load = 0;
@@ -220,6 +226,8 @@ public:
         }
         pipe_ = pipe;
         SetGlobalTensors(initParams);
+        ComputeAvgload();
+        SelectShortSequenceBuffers();
         InitLocalBuffers();
     }
 
@@ -243,21 +251,21 @@ public:
     {
         uint32_t cubeSize = alignK_ * vStep_ * sizeof(float);
         uint32_t singleVSize = vStep_ * sizeof(float);
-        uint32_t vSize = MAX_MTP * alignV_ * sizeof(float);
-        uint32_t kSize = MAX_MTP * alignK_ * sizeof(float);
+        uint32_t vSize = sequenceCapacity_ * alignV_ * sizeof(float);
+        uint32_t kSize = sequenceCapacity_ * alignK_ * sizeof(float);
         uint32_t betaUbSize =
-            Ceil(MAX_MTP * NV_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK * sizeof(float); //  8: 8 * 4 = 32B;
-        pipe_->InitBuffer(qInBuf_, MAX_MTP * alignK_ * sizeof(inType));
-        pipe_->InitBuffer(kInBuf_, MAX_MTP * alignK_ * sizeof(inType));
-        pipe_->InitBuffer(vInBuf_, MAX_MTP * alignV_ * sizeof(inType));
+            Ceil(sequenceCapacity_ * NV_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK * sizeof(float);
+        pipe_->InitBuffer(qInBuf_, sequenceCapacity_ * alignK_ * sizeof(inType));
+        pipe_->InitBuffer(kInBuf_, sequenceCapacity_ * alignK_ * sizeof(inType));
+        pipe_->InitBuffer(vInBuf_, sequenceCapacity_ * alignV_ * sizeof(inType));
         pipe_->InitBuffer(stateInBuf_, alignK_ * vStep_ * sizeof(inType));
         if (hasGama_) {
-            pipe_->InitBuffer(gamaInBuf_, MAX_MTP * NV_ * sizeof(float));
+            pipe_->InitBuffer(gamaInBuf_, sequenceCapacity_ * NV_ * sizeof(float));
         }
         if (hasGamaK_) {
-            pipe_->InitBuffer(gamaKInBuf_, MAX_MTP * alignK_ * sizeof(float));
+            pipe_->InitBuffer(gamaKInBuf_, sequenceCapacity_ * alignK_ * sizeof(float));
         }
-        pipe_->InitBuffer(betaInBuf_, MAX_MTP * NV_ * sizeof(inType));
+        pipe_->InitBuffer(betaInBuf_, sequenceCapacity_ * NV_ * sizeof(inType));
         pipe_->InitBuffer(stateOutBuf_, alignK_ * vStep_ * sizeof(outType));
         pipe_->InitBuffer(attnOutBuf_, vStep_ * sizeof(outType));
         pipe_->InitBuffer(tmpBuff, restUbSize_);
@@ -266,11 +274,11 @@ public:
         buffOffset += singleVSize;
         attnInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(vStep_), buffOffset);
         buffOffset += singleVSize;
-        vInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(MAX_MTP * alignV_), buffOffset);
+        vInUb = tmpBuff.GetWithOffset<float>(sequenceCapacity_ * alignV_, buffOffset);
         buffOffset += vSize;
-        qInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(MAX_MTP * alignK_), buffOffset);
+        qInUb = tmpBuff.GetWithOffset<float>(sequenceCapacity_ * alignK_, buffOffset);
         buffOffset += kSize;
-        kInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(MAX_MTP * alignK_), buffOffset);
+        kInUb = tmpBuff.GetWithOffset<float>(sequenceCapacity_ * alignK_, buffOffset);
         buffOffset += kSize + REPEAT_BYTES;
         stateInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(alignK_ * vStep_), buffOffset);
         buffOffset += cubeSize + 128;
@@ -285,22 +293,54 @@ public:
     __aicore__ inline void ComputeAvgload()
     {
         uint64_t realT = 0;
+        bool shortSequence = true;
         for (uint64_t batch_i = 0; batch_i < B_; batch_i++) {
-            realT += cuSeqlensGm_.GetValue(batch_i);
+            int32_t seqLen = cuSeqlensGm_.GetValue(batch_i);
+            realT += seqLen;
+            shortSequence = shortSequence && seqLen >= 0 && seqLen <= SHORT_SEQUENCE_CAPACITY;
         }
+        canUseShortSequence_ = shortSequence && realT > 0;
         avgload = Ceil(realT * NV_, GetBlockNum());
+    }
+
+    __aicore__ inline void SelectShortSequenceBuffers()
+    {
+        // Use the maximum-length predicate from the existing device-side scan.
+        // T/B is not a safe bound for mixed lengths or graph padding. Longer
+        // sequences and unsupported shapes retain the original host tiling.
+        if (!canUseShortSequence_ || realK_ != FULL_STATE_TILE_DIM || realV_ != FULL_STATE_TILE_DIM ||
+            vStep_ >= realV_) {
+            return;
+        }
+        const uint32_t alignedHeads = Ceil(NV_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
+        const uint32_t inputBytes = SHORT_SEQUENCE_CAPACITY *
+            (2 * alignK_ * sizeof(inType) + alignV_ * sizeof(inType) + alignedHeads * sizeof(inType) +
+             (hasGama_ ? alignedHeads * sizeof(float) : 0) + (hasGamaK_ ? alignK_ * sizeof(float) : 0)) +
+            UB_RESERVE_BYTES;
+        const uint32_t stateBytes = alignK_ * realV_;
+        const uint32_t queueBytes = stateBytes * (sizeof(inType) + sizeof(outType)) +
+            realV_ * sizeof(outType);
+        const uint32_t scratchBytes = SHORT_SEQUENCE_CAPACITY *
+            (2 * alignK_ + alignV_ + alignedHeads) * sizeof(float) +
+            (2 * stateBytes + (alignK_ / 2) * realV_ + 2 * realV_) * sizeof(float) +
+            REPEAT_BYTES + STATE_BANK_PADDING_BYTES;
+        if (inputBytes + queueBytes + scratchBytes > ubSize_) {
+            return;
+        }
+        sequenceCapacity_ = SHORT_SEQUENCE_CAPACITY;
+        vStep_ = realV_;
+        restUbSize_ = ubSize_ - inputBytes - queueBytes;
     }
 
     __aicore__ inline void Process()
     {
-        ComputeAvgload();
         int32_t seq1 = 0;
         for (uint64_t batch_i = 0; batch_i < B_; batch_i++) {
             int32_t seqLen = cuSeqlensGm_.GetValue(batch_i);
             if (seqLen <= 0) {
                 continue;
             }
-            if (seqLen > static_cast<int32_t>(MAX_MTP)) {
+            if (seqLen > static_cast<int32_t>(sequenceCapacity_)) {
                 return;
             }
             if (seq1 < 0 || seq1 > static_cast<int32_t>(T_) || (seq1 + seqLen) > static_cast<int32_t>(T_)) {
@@ -488,9 +528,22 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         Muls(deltaInUb, deltaInUb, beta_, curSingleV);
         AscendC::PipeBarrier<PIPE_V>();
-        Broadcast<float, 2, 1>(broadTmpInUb, deltaInUb, stateShape, deltaShape); //  2: Dim Number 1: Second Dim
+        // Broadcast one delta per V row into a 32-byte block instead of
+        // materializing a full V-by-K tensor. Repeat strides reuse the key
+        // vector and row coefficient without changing recurrent arithmetic.
+        Brcb(broadTmpInUb, deltaInUb, Ceil(curSingleV, FP32_NUM_PER_BLOCK),
+             {1, static_cast<uint16_t>(FP32_NUM_PER_BLOCK)});
         AscendC::PipeBarrier<PIPE_V>();
-        MatVecMul(broadTmpInUb, kInUb[curQKOffset], stateInUb, curSingleV, true);
+        const uint8_t rowStride = alignK_ / FP32_NUM_PER_BLOCK;
+        for (uint32_t kOffset = 0; kOffset < alignK_; kOffset += REPEAT_LENTH) {
+            const uint64_t mask = Std::min(REPEAT_LENTH, alignK_ - kOffset);
+            for (uint32_t row = 0; row < curSingleV; row += MAX_REPEAT_TIME) {
+                const uint64_t repeats = Std::min(static_cast<uint32_t>(MAX_REPEAT_TIME), curSingleV - row);
+                MulAddDst(stateInUb[row * alignK_ + kOffset], kInUb[curQKOffset + kOffset],
+                          broadTmpInUb[row * FP32_NUM_PER_BLOCK], mask, repeats,
+                          {1, 1, 0, rowStride, 0, 1});
+            }
+        }
         AscendC::PipeBarrier<PIPE_V>();
         MatVecMul(stateInUb, qInUb[curQKOffset], broadTmpInUb, curSingleV, false);
         AscendC::PipeBarrier<PIPE_V>();
@@ -660,6 +713,8 @@ private:
     uint32_t realV_;
     uint32_t vStep_;
     uint32_t restUbSize_;
+    uint32_t ubSize_;
+    uint32_t sequenceCapacity_;
     uint32_t load;
     uint32_t usedblk;
     uint32_t avgload;
@@ -667,6 +722,7 @@ private:
     bool hasGama_;
     bool hasGamaK_;
     bool useAddFoldReduce_;
+    bool canUseShortSequence_;
     float gama_;
     float beta_;
     float scale_;

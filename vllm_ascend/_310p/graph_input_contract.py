@@ -177,14 +177,19 @@ def capture_graph_input_sources(
     """Capture contracts for component-provided semantic tensor roles."""
     roles: set[str] = set()
     contracts: list[GraphInputTensorContract] = []
+    # Deduplicate host metadata only within this call. Every semantic role is
+    # still checked, and distinct views are never merged by storage pointer.
+    sampled: dict[int, GraphInputTensorContract] = {}
     for source in sources:
         if not source.role:
             raise GraphInputContractError("graph input semantic role is required")
         if source.role in roles:
             raise GraphInputContractError(f"duplicate graph input semantic role: {source.role}")
         roles.add(source.role)
-        contracts.append(
-            _capture_tensor(
+        tensor_id = id(source.tensor)
+        previous = sampled.get(tensor_id)
+        if previous is None:
+            contract = _capture_tensor(
                 source.role,
                 source.tensor,
                 ownership=source.ownership,
@@ -193,7 +198,40 @@ def capture_graph_input_sources(
                 mutable=source.mutable,
                 bounded_view=source.bounded_view,
             )
-        )
+            sampled[tensor_id] = contract
+        else:
+            alignment = source.required_alignment
+            if alignment is None:
+                alignment = source.tensor.element_size()
+            if alignment <= 0:
+                raise GraphInputContractError(
+                    f"{source.role}: required alignment must be positive, got {source.required_alignment}"
+                )
+            if not source.ownership:
+                raise GraphInputContractError(f"{source.role}: tensor ownership is required")
+            if not source.alignment_source:
+                raise GraphInputContractError(f"{source.role}: alignment source is required")
+            contract = GraphInputTensorContract(
+                path=source.role,
+                data_ptr=previous.data_ptr,
+                base_ptr=previous.base_ptr,
+                storage_offset=previous.storage_offset,
+                storage_nbytes=previous.storage_nbytes,
+                view_start_byte=previous.view_start_byte,
+                view_end_byte=previous.view_end_byte,
+                dtype=previous.dtype,
+                shape=previous.shape,
+                stride=previous.stride,
+                contiguous=previous.contiguous,
+                device=previous.device,
+                ownership=source.ownership,
+                required_alignment=alignment,
+                alignment_source=source.alignment_source,
+                alignment_ok=previous.data_ptr % alignment == 0,
+                mutable=source.mutable,
+                bounded_view=source.bounded_view,
+            )
+        contracts.append(contract)
     return tuple(contracts)
 
 
@@ -226,6 +264,10 @@ def validate_graph_input_contracts(
 
     comparable_fields = tuple(field.name for field in fields(GraphInputTensorContract))
     for expected_contract, actual_contract in zip(expected, actual):
+        # Dataclass equality checks all fields. Preserve detailed mismatch
+        # diagnostics and reject invalid alignment even for equal contracts.
+        if expected_contract == actual_contract and actual_contract.alignment_ok:
+            continue
         if expected_contract.path != actual_contract.path:
             raise GraphInputContractError(
                 f"graph input tensor path changed: expected {expected_contract.path}, got {actual_contract.path}"
