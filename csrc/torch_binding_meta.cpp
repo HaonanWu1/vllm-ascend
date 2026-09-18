@@ -1737,6 +1737,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> chunk_gat
     return std::make_tuple(q_kernel, k_kernel, w_kernel, u_kernel, g_kernel);
 }
 
+at::Tensor npu_quant_grouped_matmul_dequant_310_meta(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& weight_scale,
+    const at::Tensor& group_list, const at::Tensor& x_scale)
+{
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "Expected X[M,K] and W[E,N,K]");
+    return at::empty_symint(c10::SymDimVector{x.sym_size(0), weight.sym_size(1)}, x.options());
+}
+
 void store_kv_block_metadata(
     const at::Tensor &slot_mapping_npu,
     const at::Tensor &group_len,
@@ -1768,6 +1776,7 @@ void store_kv_block(
 // Pybind on Ascend 310P
 namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+    ops.impl("npu_quant_grouped_matmul_dequant_310", &vllm_ascend::meta::npu_quant_grouped_matmul_dequant_310_meta);
     // causal_conv1d_310
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310

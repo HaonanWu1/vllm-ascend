@@ -733,6 +733,9 @@ def test_builder_builds_prebuilt_chunk_metadata_with_prefill_query_start_loc(mon
         attn_metadata.prefill_query_start_loc,
     )
     assert chunk_meta.cu_seqlens_host == tuple(attn_metadata.prefill_query_start_loc.to(torch.int64).tolist())
+    assert attn_metadata.non_spec_prefill_metadata.query_start_loc_host == tuple(
+        attn_metadata.non_spec_query_start_loc.to(torch.int64).tolist()
+    )
     expected_chunk_indices = runtime_prepare_chunk_indices(
         attn_metadata.prefill_query_start_loc,
         ascend_gdn_attn_builder._GDN_CHUNK_SIZE,

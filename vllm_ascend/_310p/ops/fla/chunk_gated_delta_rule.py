@@ -258,10 +258,10 @@ def _pad_varlen_to_chunk(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    cu_seqlens: torch.Tensor,
+    cu_seqlens: tuple[int, ...],
     chunk_size: int,
 ) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, int, int]], torch.Tensor
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, int, int]], tuple[int, ...]
 ]:
     q_parts: list[torch.Tensor] = []
     k_parts: list[torch.Tensor] = []
@@ -272,9 +272,9 @@ def _pad_varlen_to_chunk(
     padded_cu = [0]
     out_cursor = 0
 
-    for seq_idx in range(cu_seqlens.numel() - 1):
-        start = int(cu_seqlens[seq_idx].item())
-        end = int(cu_seqlens[seq_idx + 1].item())
+    for seq_idx in range(len(cu_seqlens) - 1):
+        start = cu_seqlens[seq_idx]
+        end = cu_seqlens[seq_idx + 1]
         seq_len = end - start
         padded_len = _ceil_div(seq_len, chunk_size) * chunk_size if seq_len > 0 else 0
         pad_len = padded_len - seq_len
@@ -313,15 +313,14 @@ def _pad_varlen_to_chunk(
         g_padded = g[:, :0]
         beta_padded = beta[:, :0]
 
-    cu_padded = torch.tensor(padded_cu, dtype=torch.int64, device=cu_seqlens.device)
-    return q_padded, k_padded, v_padded, g_padded, beta_padded, seq_ranges, cu_padded
+    return q_padded, k_padded, v_padded, g_padded, beta_padded, seq_ranges, tuple(padded_cu)
 
 
-def _prepare_chunk_indices_list(cu_seqlens: torch.Tensor, chunk_size: int) -> list[int]:
+def _prepare_chunk_indices_list(cu_seqlens: tuple[int, ...], chunk_size: int) -> list[int]:
     chunk_indices: list[int] = []
     compact_seq_idx = 0
-    for seq_idx in range(cu_seqlens.numel() - 1):
-        seq_len = int(cu_seqlens[seq_idx + 1].item() - cu_seqlens[seq_idx].item())
+    for seq_idx in range(len(cu_seqlens) - 1):
+        seq_len = cu_seqlens[seq_idx + 1] - cu_seqlens[seq_idx]
         num_chunks = _ceil_div(seq_len, chunk_size) if seq_len > 0 else 0
         if num_chunks == 0:
             continue
@@ -635,6 +634,7 @@ def chunk_gated_delta_rule_310(
     cu_seqlens: torch.Tensor | None = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens_host: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """310P chunk GDN path backed by AscendC fwd_h/fwd_o kernels.
 
@@ -667,13 +667,16 @@ def chunk_gated_delta_rule_310(
         chunk_indices_list = None
         num_states = q.shape[0]
     else:
+        if cu_seqlens_host is None:
+            cu_seqlens_host = tuple(cu_seqlens.to(torch.int64).cpu().reshape(-1).tolist())
+        elif len(cu_seqlens_host) != cu_seqlens.numel():
+            raise ValueError(f"cu_seqlens_host must contain {cu_seqlens.numel()} entries, got {len(cu_seqlens_host)}.")
         q_pad, k_pad, v_pad, g_pad, beta_pad, seq_ranges, cu_kernel = _pad_varlen_to_chunk(
-            q, k, v, g, beta, cu_seqlens.to(torch.int64).cpu(), CHUNK_SIZE
+            q, k, v, g, beta, cu_seqlens_host, CHUNK_SIZE
         )
-        assert cu_kernel is not None
-        cu_list = cu_kernel.tolist()
+        cu_list = list(cu_kernel)
         chunk_indices_list = _prepare_chunk_indices_list(cu_kernel, CHUNK_SIZE)
-        num_states = cu_seqlens.numel() - 1
+        num_states = len(cu_seqlens_host) - 1
 
     expected_state_shape = (num_states, v.shape[2], v.shape[-1], k.shape[-1])
     if initial_state is not None:

@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_ascend._310p import graph_input_contract as contract_module
 from vllm_ascend._310p.graph_input_contract import (
     GraphInputContractError,
     GraphInputSource,
@@ -26,6 +27,68 @@ from vllm_ascend._310p.graph_input_contract import (
     capture_graph_input_sources,
     validate_graph_input_contracts,
 )
+
+
+def _source(role, tensor, **kwargs):
+    return GraphInputSource(
+        role=role,
+        tensor=tensor,
+        ownership="test",
+        required_alignment=tensor.element_size(),
+        alignment_source="natural",
+        mutable=True,
+        bounded_view=True,
+        **kwargs,
+    )
+
+
+def test_shared_tensor_sampled_once_but_views_kept_separate(monkeypatch):
+    tensor = torch.empty(16)
+    view = tensor.view(4, 4)
+    sources = tuple(_source(f"role{i}", tensor) for i in range(20)) + (_source("view", view),)
+    original = contract_module._capture_tensor
+    calls = []
+
+    def count(*args, **kwargs):
+        calls.append(id(args[1]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(contract_module, "_capture_tensor", count)
+    result = capture_graph_input_sources(sources)
+    capture_graph_input_sources(sources)
+    assert len(calls) == 4
+    assert result[0].shape == (16,)
+    assert result[-1].shape == (4, 4)
+
+
+def test_shared_tensor_policy_is_not_cached():
+    tensor = torch.empty(16)
+    first = _source("first", tensor)
+    second = replace(first, role="second", ownership="other", mutable=False, bounded_view=False)
+    left, right = capture_graph_input_sources((first, second))
+    assert left.ownership == "test" and right.ownership == "other"
+    assert left.mutable and not right.mutable
+    assert left.bounded_view and not right.bounded_view
+    for kwargs in ({"ownership": ""}, {"required_alignment": 0}, {"alignment_source": ""}):
+        with pytest.raises(GraphInputContractError):
+            capture_graph_input_sources((first, replace(second, **kwargs)))
+
+
+def test_shared_tensor_resampled_after_resize():
+    tensor = torch.empty(16)
+    sources = (_source("first", tensor), _source("second", tensor))
+    before = capture_graph_input_sources(sources)
+    tensor.resize_(4, 4)
+    after = capture_graph_input_sources(sources)
+    with pytest.raises(GraphInputContractError):
+        validate_graph_input_contracts(before, after)
+
+
+def test_equal_but_invalid_alignment_still_rejected():
+    captured = capture_graph_input_contracts((torch.empty(16),), {})
+    bad = (replace(captured[0], alignment_ok=False),)
+    with pytest.raises(GraphInputContractError):
+        validate_graph_input_contracts(bad, bad)
 
 
 def test_capture_graph_input_contracts_discovers_nested_args_and_kwargs() -> None:

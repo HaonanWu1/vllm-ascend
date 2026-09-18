@@ -20,7 +20,12 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.fused_moe.moe_comm_method import AllGatherCommImpl310
-from vllm_ascend._310p.fused_moe.moe_mlp import _quant_grouped_matmul, quant_apply_mlp, unified_apply_mlp
+from vllm_ascend._310p.fused_moe.moe_mlp import (
+    _quant_grouped_matmul,
+    _supports_named_quant_gmm,
+    quant_apply_mlp,
+    unified_apply_mlp,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
     MoEQuantParams,
@@ -310,3 +315,62 @@ def test_quant_mlp_computes_separate_scales_around_swiglu(quant_gmm_mocks, group
     torch.testing.assert_close(second["x_scale"], torch.full((640,), 2.0 / 127.0), rtol=0, atol=0)
     torch.testing.assert_close(first["group_list"], expected_groups)
     torch.testing.assert_close(second["group_list"], expected_groups)
+
+
+@pytest.mark.parametrize("use_named", [True, False])
+def test_named_op_dispatch_and_old_extension_compatibility(quant_gmm_mocks, use_named):
+    _, cann = quant_gmm_mocks
+    inputs = make_quant_gmm_inputs()
+    named = MagicMock() if use_named else None
+    with (
+        patch.object(torch.ops._C_ascend, "npu_quant_grouped_matmul_dequant_310", named, create=True),
+        patch("vllm_ascend._310p.fused_moe.moe_mlp._supports_named_quant_gmm", return_value=True),
+    ):
+        result = _quant_grouped_matmul(*inputs)
+    if use_named:
+        assert result is named.return_value
+        cann.assert_not_called()
+        assert named.call_args.args[:4] == inputs
+        torch.testing.assert_close(named.call_args.args[4], torch.full((640,), 0.5 / 127), rtol=0, atol=0)
+    else:
+        assert result is cann.return_value
+
+
+def test_named_op_errors_are_not_silently_retried(quant_gmm_mocks):
+    _, cann = quant_gmm_mocks
+    with (
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_quant_grouped_matmul_dequant_310",
+            MagicMock(side_effect=RuntimeError("kernel failed")),
+            create=True,
+        ),
+        patch("vllm_ascend._310p.fused_moe.moe_mlp._supports_named_quant_gmm", return_value=True),
+        pytest.raises(RuntimeError, match="kernel failed"),
+    ):
+        _quant_grouped_matmul(*make_quant_gmm_inputs())
+    cann.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", [None, "device", "scale_shape", "group_shape", "strided", "format"])
+def test_named_layout_guard_reads_only_metadata(invalid):
+    tensors = [MagicMock(spec=torch.Tensor) for _ in range(4)]
+    x, weight, scale, groups = tensors
+    device = MagicMock()
+    device.type = "npu"
+    for tensor in tensors:
+        tensor.device = device
+        tensor.is_contiguous.return_value = True
+        tensor.cpu.side_effect = AssertionError("must not read device values")
+        tensor.item.side_effect = AssertionError("must not read device values")
+    x.shape, weight.shape, scale.shape, groups.shape = (640, 256), (256, 2048, 256), (256, 2048), (256,)
+    if invalid == "device":
+        groups.device = MagicMock()
+    elif invalid == "scale_shape":
+        scale.shape = (256, 2047)
+    elif invalid == "group_shape":
+        groups.shape = (255,)
+    elif invalid == "strided":
+        x.is_contiguous.return_value = False
+    with patch("torch_npu.get_npu_format", return_value=29 if invalid == "format" else 2, create=True):
+        assert _supports_named_quant_gmm(*tensors) == (invalid is None)

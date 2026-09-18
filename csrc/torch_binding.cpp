@@ -747,6 +747,38 @@ at::Tensor adn_rms_norm(
     return y;
 }
 
+at::Tensor npu_quant_grouped_matmul_dequant_310(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& weight_scale,
+    const at::Tensor& group_list, const at::Tensor& x_scale)
+{
+    TORCH_CHECK(x.is_privateuseone(), "Expected NPU inputs");
+    const c10::OptionalDeviceGuard device_guard(x.device());
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3 && x.size(0) == 640 && weight.size(0) == 256,
+                "VllmQuantGroupedMatmulDequantV310 requires 640 rows and 256 experts");
+    const bool gate = x.size(1) == 2048 && weight.size(1) == 512 && weight.size(2) == 2048;
+    const bool down = x.size(1) == 256 && weight.size(1) == 2048 && weight.size(2) == 256;
+    TORCH_CHECK(gate || down, "Unsupported MoE projection shape");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && weight.scalar_type() == at::kChar &&
+                weight_scale.scalar_type() == at::kFloat && group_list.scalar_type() == at::kLong &&
+                x_scale.scalar_type() == at::kFloat, "Expected FP16 X, INT8 W, FP32 scales, INT64 groups");
+    TORCH_CHECK(weight_scale.dim() == 2 && weight_scale.size(0) == 256 &&
+                weight_scale.size(1) == weight.size(1) && group_list.dim() == 1 &&
+                group_list.numel() == 256 && x_scale.dim() == 1 && x_scale.numel() == 640,
+                "Invalid scales or cumulative group_list shape");
+    for (const auto& tensor : {x, weight, weight_scale, group_list, x_scale}) {
+        TORCH_CHECK(tensor.device() == x.device(), "All inputs must be on the same NPU");
+        TORCH_CHECK(tensor.is_contiguous(), "Inputs must be contiguous");
+    }
+    TORCH_CHECK(NPUBridge::GetNpuStorageImplDesc(weight).npu_format_ == ACL_FORMAT_FRACTAL_NZ,
+                "Weight must have FRACTAL_NZ storage");
+    for (const auto& tensor : {x, weight_scale, group_list, x_scale}) {
+        TORCH_CHECK(IsOpInputBaseFormat(tensor), "Only weight may use an internal storage format");
+    }
+    at::Tensor output = at::empty({x.size(0), weight.size(1)}, x.options());
+    EXEC_NPU_CMD(aclnnVllmQuantGroupedMatmulDequantV310, x, weight, weight_scale, group_list, x_scale, output);
+    return output;
+}
+
 at::Tensor npu_rejection_sample_greedy_310(
     const at::Tensor &cu_num_draft_tokens,
     const at::Tensor &draft_token_ids,
@@ -2295,6 +2327,10 @@ std::vector<int64_t> get_npu_storage_shape(const at::Tensor& tensor)
 // Pybind on Ascend 310P
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+    ops.def("npu_quant_grouped_matmul_dequant_310(Tensor x, Tensor weight, Tensor weight_scale, "
+            "Tensor group_list, Tensor x_scale) -> Tensor");
+    ops.impl("npu_quant_grouped_matmul_dequant_310", torch::kPrivateUse1,
+             &vllm_ascend::npu_quant_grouped_matmul_dequant_310);
     ops.def(
         "npu_causal_conv1d_310(Tensor x, "
         "                         Tensor weight, "

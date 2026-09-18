@@ -18,6 +18,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -25,12 +26,28 @@ from vllm_ascend._310p.ops import gdn_attn_builder_310
 from vllm_ascend._310p.ops.fla.gdn_310 import (
     AscendGatedDeltaNetAttention310,
     _mask_padded_recurrent_accepted_tokens,
+    _rearrange_mixed_qkv_310,
     _zero_padded_tokens,
 )
 from vllm_ascend._310p.ops.gdn_attn_builder_310 import (
     AscendGDNAttentionBackend310,
     AscendGDNAttentionMetadataBuilder310,
 )
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 8, 80])
+@pytest.mark.parametrize("strided", [False, True])
+def test_rearrange_qkv_preserves_values_without_concat(tokens, strided):
+    layer = SimpleNamespace(key_dim=32, value_dim=64, tp_size=2, head_k_dim=8, head_v_dim=8)
+    mixed = torch.arange(tokens * 128, dtype=torch.float32).reshape(tokens, 128)
+    mixed = mixed[:, ::2] if strided else mixed[:, :64].contiguous()
+    with patch("torch.cat", side_effect=AssertionError("QKV rearrange must not concatenate")):
+        query, key, value = _rearrange_mixed_qkv_310(layer, mixed)
+    for actual, expected, heads in zip((query, key, value), mixed.split([16, 16, 32], dim=-1), (2, 2, 4)):
+        assert actual.is_contiguous()
+        assert actual.shape == (1, tokens, heads, 8)
+        assert torch.equal(actual.reshape(tokens, heads * 8), expected)
+    assert _rearrange_mixed_qkv_310(layer, None) == (None, None, None)
 
 
 def test_ascend_gdn_attention_310_uses_310p_backend():

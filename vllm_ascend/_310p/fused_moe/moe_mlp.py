@@ -28,6 +28,17 @@ _FRACTAL_NZ_FORMAT = 29
 _INT8_QUANT_MAX = 127.0
 
 
+def _supports_named_quant_gmm(x, weight, weight_scale, group_list) -> bool:
+    """Layout guard after the validated shape/dtype guard; metadata only."""
+    return (
+        x.device.type == "npu"
+        and tuple(weight_scale.shape) == tuple(weight.shape[:2])
+        and tuple(group_list.shape) == (weight.shape[0],)
+        and all(t.device == x.device and t.is_contiguous() for t in (x, weight, weight_scale, group_list))
+        and all(torch_npu.get_npu_format(t) in (0, 2) for t in (x, weight_scale, group_list))
+    )
+
+
 def _quant_grouped_matmul(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -52,6 +63,12 @@ def _quant_grouped_matmul(
         # Keep FP32 scale division and a nonzero scale for all-zero rows.
         absmax = x.abs().amax(dim=-1).float()
         x_scale = torch.where(absmax == 0, torch.ones_like(absmax), absmax / _INT8_QUANT_MAX)
+        # Custom ops are loaded by worker initialization. An older extension
+        # or unsupported tensor layout keeps the original CANN call below.
+        # This dispatch uses metadata only, never a device-to-host group read.
+        custom_op = getattr(torch.ops._C_ascend, "npu_quant_grouped_matmul_dequant_310", None)
+        if custom_op is not None and _supports_named_quant_gmm(x, weight, weight_scale, group_list):
+            return custom_op(x, weight, weight_scale, group_list, x_scale)
     return torch_npu.npu_quant_grouped_matmul_dequant(
         x=x,
         quantized_weight=weight,

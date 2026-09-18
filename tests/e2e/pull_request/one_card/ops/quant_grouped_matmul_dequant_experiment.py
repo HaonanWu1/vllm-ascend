@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicit opt-in regression for the unregistered 310P MoE experiment.
+"""Explicit real-weight regression for the 310P grouped MoE operator.
 
-Run in separate processes for the installed kernel and a process-private OPP
-overlay. This script does not install an operator or change the toolkit.
+Select the installed CANN kernel or the independently registered custom op.
+This script does not install an operator or change the toolkit.
 Captures must contain x, weight (ND), scale, groups, and layer from real weights.
 """
 
@@ -64,6 +64,20 @@ def input_cases(data, routing):
             ("tiny", tiny, groups),
         ]
     )
+    # Exercise padded-M boundaries and both sides of the 80-row private slot.
+    # Keep the names used by the frozen candidate regression references.
+    for size in (31, 63, 65, 79, 80, 81, 82, 127, 128, 129):
+        counts = torch.zeros(256, dtype=torch.int64)
+        full = min(255, 640 // size)
+        counts[:full] = size
+        counts[full] = 640 - full * size
+        cases.append((f"extended_group_size_{size}", values, counts.cumsum(0)))
+    counts = torch.zeros(256, dtype=torch.int64)
+    sizes = [8, 9, 16, 17, 79, 80, 81]
+    sizes.append(640 - sum(sizes))
+    for index, size in zip((0, 4, 31, 64, 128, 192, 254, 255), sizes):
+        counts[index] = size
+    cases.append(("mixed_independent_shared_boundary", values, counts.cumsum(0)))
     return cases
 
 
@@ -96,6 +110,12 @@ def run(options):
     torch.set_num_threads(4)
     torch.npu.set_device(0)
     torch_npu.npu.set_compile_mode(jit_compile=False)
+    use_custom = getattr(options, "implementation", "cann") == "custom"
+    if use_custom:
+        from vllm_ascend.utils import enable_custom_op
+
+        assert enable_custom_op(), "Custom extension must be built for this regression"
+        assert hasattr(torch.ops._C_ascend, "npu_quant_grouped_matmul_dequant_310")
     results = []
     with torch.inference_mode():
         for path in files:
@@ -108,6 +128,10 @@ def run(options):
             def compute(values=x, ends=groups, weights=weight, scales=weight_scale):
                 absmax = values.abs().amax(-1).float()
                 x_scale = torch.where(absmax == 0, torch.ones_like(absmax), absmax / 127)
+                if use_custom and values.shape[0] == 640:
+                    return torch.ops._C_ascend.npu_quant_grouped_matmul_dequant_310(
+                        values, weights, scales, ends, x_scale
+                    )
                 return torch_npu.npu_quant_grouped_matmul_dequant(
                     x=values,
                     quantized_weight=weights,
@@ -166,6 +190,7 @@ if __name__ == "__main__":
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference", type=Path)
+    parser.add_argument("--implementation", choices=("cann", "custom"), default="cann")
     parser.add_argument(
         "--replays", type=int, default=5, help="Graph replays per input; first baseline output is frozen"
     )

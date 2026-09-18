@@ -18,15 +18,18 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
-from vllm.model_executor.layers.fla.ops.utils import tensor_cache
 
 from vllm_ascend._310p.ops.adn_rms_norm import adn_rms_norm_or_fallback
 
 
-@tensor_cache
+@lru_cache(maxsize=8)
 def _l2norm_unit_weight(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    # These keys describe values, not tensor identities. In particular,
+    # x.device may return a fresh but equal device object on every access.
+    # Keep the existing bounded cache; no activations are retained here.
     # RMSNorm with weight 1/sqrt(dim) matches L2 norm: x / sqrt(sum(x^2)).
     return torch.full((dim,), 1.0 / math.sqrt(dim), dtype=dtype, device=device)
 
