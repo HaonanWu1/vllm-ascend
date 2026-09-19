@@ -5,12 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 
 # Apply the Ascend platform patches to the upstream Scheduler class used by
@@ -34,6 +36,7 @@ def _make_scheduler(
     prefix_caching: bool = True,
     scheduler_block_size: int = 1280,
     cache_block_size: int = 640,
+    gdn: bool = False,
 ):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.block_size = scheduler_block_size
@@ -45,6 +48,19 @@ def _make_scheduler(
         speculative_config=_SpeculativeConfig(method),
     )
     scheduler.use_eagle = True
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+    if gdn:
+        scheduler.kv_cache_config.kv_cache_groups.append(
+            KVCacheGroupSpec(
+                layer_names=["gdn"],
+                kv_cache_spec=MambaSpec(
+                    block_size=scheduler_block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float16,),
+                    mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+                ),
+            )
+        )
     return scheduler
 
 
@@ -329,3 +345,90 @@ def test_fallback_supports_legacy_mamba_split_signature(monkeypatch) -> None:
 
     assert result == 321
     assert captured["args"] == (scheduler, request, 700, 11, 13)
+
+
+@pytest.mark.parametrize("prefix_caching", [True, False])
+@pytest.mark.parametrize(
+    ("computed", "requested", "prompt_tokens", "expected"),
+    [
+        (0, 150, 4106, 128),
+        (0, 1952, 4106, 1920),
+        (128, 1952, 4106, 1920),
+        (0, 63, 4106, 0),
+        (0, 64, 4106, 64),
+        (0, 65, 4106, 64),
+        (128, 22, 4106, 0),
+        (128, 22, 150, 22),
+        (2304, 1802, 4106, 1802),
+        (0, 31, 31, 31),
+        (0, 0, 4106, 0),
+    ],
+)
+def test_gdn_intermediate_prefill_keeps_numerical_chunks(
+    computed, requested, prompt_tokens, expected, prefix_caching
+) -> None:
+    scheduler = _make_scheduler(gdn=True, scheduler_block_size=2304, prefix_caching=prefix_caching)
+    request = _make_request(num_tokens=prompt_tokens, num_computed_tokens=computed)
+    assert scheduler._mamba_block_aligned_split(request, requested) == expected
+
+
+def test_gdn_alignment_uses_local_and_external_cached_prefix() -> None:
+    scheduler = _make_scheduler(gdn=True, scheduler_block_size=2304)
+    request = _make_request(num_tokens=4106, num_computed_tokens=64)
+    assert scheduler._mamba_block_aligned_split(request, 150, 64, 64) == 128
+
+
+def test_gdn_keeps_mamba_checkpoint_and_final_short_chunk() -> None:
+    scheduler = _make_scheduler(gdn=True, scheduler_block_size=2304)
+    request = _make_request(num_tokens=4106)
+    chunks = []
+    for budget in (150, 1952, 1952, 1952):
+        remaining = request.num_tokens - request.num_computed_tokens
+        count = scheduler._mamba_block_aligned_split(request, min(budget, remaining))
+        chunks.append(count)
+        request.num_computed_tokens += count
+    assert chunks == [128, 1920, 256, 1802]
+
+
+@pytest.mark.parametrize("draft_tokens", [7, 15])
+def test_gdn_does_not_change_decode_or_speculative_verification(draft_tokens) -> None:
+    scheduler = _make_scheduler(gdn=True, scheduler_block_size=2304)
+    request = _make_request(num_tokens=4107, num_computed_tokens=4106)
+    request.num_prompt_tokens = 4106
+    assert scheduler._mamba_block_aligned_split(request, draft_tokens + 1) == draft_tokens + 1
+
+
+@pytest.mark.parametrize(
+    ("budget", "threshold", "block_size", "valid"),
+    [
+        (1952, 0, 2304, True),
+        (64, 64, 2304, True),
+        (63, 0, 2304, False),
+        (1952, 63, 2304, False),
+        (1952, 0, 2305, False),
+    ],
+)
+def test_gdn_init_rejects_non_progressing_or_misaligned_configs(
+    monkeypatch, budget, threshold, block_size, valid
+) -> None:
+    scheduler = _make_scheduler(gdn=True, scheduler_block_size=block_size)
+    scheduler.max_num_scheduled_tokens = budget
+    scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=threshold)
+    scheduler.need_mamba_block_aligned_split = False
+    monkeypatch.setattr(scheduler_patch, "_original_scheduler_init", lambda *a, **kw: None)
+    if valid:
+        scheduler_patch._dflash_scheduler_init(scheduler, scheduler.vllm_config)
+        assert scheduler.need_mamba_block_aligned_split
+    else:
+        with pytest.raises(ValueError, match="310P DFlash GDN"):
+            scheduler_patch._dflash_scheduler_init(scheduler, scheduler.vllm_config)
+
+
+def test_gdn_without_prefix_cache_still_enables_numerical_alignment(monkeypatch) -> None:
+    scheduler = _make_scheduler(gdn=True, prefix_caching=False)
+    scheduler.max_num_scheduled_tokens = 1952
+    scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=0)
+    scheduler.need_mamba_block_aligned_split = False
+    monkeypatch.setattr(scheduler_patch, "_original_scheduler_init", lambda *a, **kw: None)
+    scheduler_patch._dflash_scheduler_init(scheduler, scheduler.vllm_config)
+    assert scheduler.need_mamba_block_aligned_split

@@ -20,10 +20,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vllm_ascend._310p.gdn_constants import GDN_PREFILL_CHUNK_SIZE
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 from vllm_ascend.utils import enable_custom_op
 
-CHUNK_SIZE = 64
+CHUNK_SIZE = GDN_PREFILL_CHUNK_SIZE
 SUPPORTED_COMPUTE_WY_HEAD_DIMS = (64, 128)
 
 
