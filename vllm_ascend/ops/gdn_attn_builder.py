@@ -553,20 +553,17 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     dtype=torch.int32,
                     device=query_start_loc.device,
                 )
-                torch.cumsum(
-                    spec_query_lens,
-                    dim=0,
-                    out=spec_query_start_loc[1:],
+                # Avoid passing offset output views to the CANN Cumsum kernel.
+                spec_query_start_loc[1:].copy_(
+                    torch.cumsum(spec_query_lens, dim=0, dtype=spec_query_start_loc.dtype)
                 )
                 non_spec_query_start_loc = torch.zeros(
                     query_lens.size(0) - num_spec_decodes + 1,
                     dtype=torch.int32,
                     device=query_start_loc.device,
                 )
-                torch.cumsum(
-                    non_spec_query_lens,
-                    dim=0,
-                    out=non_spec_query_start_loc[1:],
+                non_spec_query_start_loc[1:].copy_(
+                    torch.cumsum(non_spec_query_lens, dim=0, dtype=non_spec_query_start_loc.dtype)
                 )
                 non_spec_query_start_loc_cpu = torch.zeros(
                     query_lens_cpu.size(0) - num_spec_decodes + 1,
