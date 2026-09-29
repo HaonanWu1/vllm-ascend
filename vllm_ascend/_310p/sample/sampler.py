@@ -26,21 +26,27 @@ from vllm_ascend.sample.sampler import (
 )
 from vllm_ascend.utils import global_stream, npu_stream_switch
 
-_CPU_GENERATOR_CACHE_310P: dict[int, tuple[torch.Generator, int]] = {}
+_CPU_GENERATOR_CACHE_310P: dict[torch.Generator, torch.Generator] = {}
 
 
-def _get_cpu_generator_310p(i: int, generator: torch.Generator) -> torch.Generator:
-    cache_entry = _CPU_GENERATOR_CACHE_310P.get(i)
-    if cache_entry is None or cache_entry[1] != id(generator):
+def _get_cpu_generator_310p(generator: torch.Generator) -> torch.Generator:
+    # Batch rows change during compaction/preemption; the request's generator
+    # owns its CPU stream. Keep the object (not id) to prevent identity reuse.
+    cpu_generator = _CPU_GENERATOR_CACHE_310P.get(generator)
+    if cpu_generator is None:
         cpu_generator = torch.Generator(device="cpu")
         try:
             # Keep RNG stream consistent with the original generator.
             cpu_generator.set_state(generator.get_state())
         except Exception:
             cpu_generator.manual_seed(generator.initial_seed())
-        cache_entry = (cpu_generator, id(generator))
-        _CPU_GENERATOR_CACHE_310P[i] = cache_entry
-    return cache_entry[0]
+        _CPU_GENERATOR_CACHE_310P[generator] = cpu_generator
+    return cpu_generator
+
+
+def release_cpu_generator_310p(generator: torch.Generator | None) -> None:
+    """Release a finished/cancelled request, but retain preempted streams."""
+    _CPU_GENERATOR_CACHE_310P.pop(generator, None)
 
 
 def _fill_cpu_exponential_310p(
@@ -58,7 +64,7 @@ def _fill_cpu_exponential_310p(
     if not generators:
         return
     for i, generator in generators.items():
-        cpu_gen = _get_cpu_generator_310p(i, generator)
+        cpu_gen = _get_cpu_generator_310p(generator)
         if has_draft_mask is not None:
             temp_q = torch.empty_like(q_cpu[i])
             temp_q.exponential_(generator=cpu_gen)

@@ -1096,7 +1096,9 @@ def rejection_random_sample_pytorch(
     batch_size = output_token_ids.shape[0]
     device = output_token_ids.device
 
-    zero_cpu = torch.tensor([0], pin_memory=True)
+    # Keep offsets in the cumulative-length dtype. An untyped zero promotes
+    # int32 metadata to int64 and selects an unsafe small-vector Add on 310P.
+    zero_cpu = torch.tensor([0], dtype=cu_num_draft_tokens.dtype, pin_memory=True)
     zero_device = zero_cpu.to(device, non_blocking=True)
 
     cu_start = torch.cat([zero_device, cu_num_draft_tokens[:-1]])
@@ -1104,7 +1106,7 @@ def rejection_random_sample_pytorch(
     num_draft_per_batch = cu_end - cu_start
 
     max_draft_len = max_spec_len
-    pos_indices_cpu = torch.arange(max_draft_len, pin_memory=True)
+    pos_indices_cpu = torch.arange(max_draft_len, dtype=cu_num_draft_tokens.dtype, pin_memory=True)
     pos_indices = pos_indices_cpu.to(device, non_blocking=True)[None, :]
 
     valid_mask = pos_indices < num_draft_per_batch[:, None]
@@ -1209,10 +1211,9 @@ def rejection_random_sample_pytorch(
 
     batch_bonus_positions = bonus_positions[:, None]  # [batch_size, 1]
 
-    max_spec_len_cpu = torch.tensor([max_spec_len], pin_memory=True)
-    max_spec_len_device = max_spec_len_cpu.to(device, non_blocking=True)
-
-    valid_bonus_pos = bonus_positions < (max_spec_len_device + 1)
+    # Integer positions satisfy x < K + 1 exactly when x <= K. Avoid the
+    # unnecessary device int64 Add (including its one-element 310P kernel).
+    valid_bonus_pos = bonus_positions <= max_spec_len
     final_bonus_mask = should_add_bonus & valid_bonus_pos
 
     bonus_pos_match = all_positions == batch_bonus_positions
@@ -1417,13 +1418,13 @@ def rejection_random_sample_block_verify_pytorch(
     batch_size = output_token_ids.shape[0]
     device = output_token_ids.device
 
-    zero_cpu = torch.tensor([0], pin_memory=True)
+    zero_cpu = torch.tensor([0], dtype=cu_num_draft_tokens.dtype, pin_memory=True)
     zero_device = zero_cpu.to(device, non_blocking=True)
 
     cu_start = torch.cat([zero_device, cu_num_draft_tokens[:-1]])
     cu_end = cu_num_draft_tokens
     num_draft_per_batch = (cu_end - cu_start)[:, None]
-    pos_indices_cpu = torch.arange(max_spec_len, pin_memory=True)
+    pos_indices_cpu = torch.arange(max_spec_len, dtype=cu_num_draft_tokens.dtype, pin_memory=True)
     pos_indices = pos_indices_cpu.to(device, non_blocking=True)[None, :]
     valid_mask = pos_indices < num_draft_per_batch
     global_token_indices = cu_start[:, None] + pos_indices
@@ -1487,20 +1488,21 @@ def rejection_random_sample_block_verify_pytorch(
         legal_mask = (draft_token_probs > 0) & (pi >= cum_uniform_token_probs)
     legal_mask = legal_mask & valid_mask & (~placeholder_mask)
 
-    last_accept_pos = torch.where(
+    # Compute the rejection position directly, avoiding int64 last_pos + 1.
+    first_reject_pos = torch.where(
         legal_mask.any(dim=-1, keepdim=True),
-        (max_spec_len - legal_mask.flip(dims=[-1]).float().argmax(dim=-1, keepdim=True) - 1),
-        -1,
+        max_spec_len - legal_mask.flip(dims=[-1]).float().argmax(dim=-1, keepdim=True),
+        0,
     )
     non_greedy_mask = (~is_greedy)[:, None]
 
-    accept_mask = (pos_indices <= last_accept_pos) & valid_mask & non_greedy_mask
+    accept_mask = (pos_indices < first_reject_pos) & valid_mask & non_greedy_mask
     output_token_ids[:, :max_spec_len] = torch.where(accept_mask, draft_tokens, output_token_ids[:, :max_spec_len])
 
-    reject_mask = (pos_indices == last_accept_pos + 1) & valid_mask & non_greedy_mask
+    reject_mask = (pos_indices == first_reject_pos) & valid_mask & non_greedy_mask
     output_token_ids[:, :max_spec_len] = torch.where(reject_mask, recovered_tokens, output_token_ids[:, :max_spec_len])
 
-    bonus_mask = (last_accept_pos + 1 >= num_draft_per_batch) & non_greedy_mask
+    bonus_mask = (first_reject_pos >= num_draft_per_batch) & non_greedy_mask
     all_positions_cpu = torch.arange(max_spec_len + 1, pin_memory=True)
     all_positions = all_positions_cpu.to(device, non_blocking=True)[None, :]
     bonus_pos_match = all_positions == num_draft_per_batch
