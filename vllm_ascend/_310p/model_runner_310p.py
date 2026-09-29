@@ -69,7 +69,7 @@ from vllm_ascend._310p.piecewise_size_nodes import (
     install_piecewise_size_node_compat,
 )
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
-from vllm_ascend._310p.sample.sampler import AscendSampler310
+from vllm_ascend._310p.sample.sampler import AscendSampler310, _get_cpu_generator_310p, release_cpu_generator_310p
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
     update_num_computed_tokens_for_batch_change,
@@ -306,6 +306,12 @@ class NPUModelRunner310(NPUModelRunner):
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
 
     def _update_states(self, scheduler_output: SchedulerOutput):
+        # Read ownership before the parent removes completed/cancelled requests.
+        # Preempted or temporarily unscheduled requests retain their RNG stream.
+        for req_id in scheduler_output.finished_req_ids:
+            request = self.requests.get(req_id)
+            if request is not None:
+                release_cpu_generator_310p(request.generator)
         deferred = super()._update_states(scheduler_output)
         if scheduler_output.finished_req_ids:
             # condense() rewrites block_table.np (move_row). Drain the previous
@@ -317,6 +323,22 @@ class NPUModelRunner310(NPUModelRunner):
             # layout-change steps only.
             torch.npu.current_stream().synchronize()
         return deferred
+
+    def _sample(self, logits, spec_decode_metadata):
+        # Chunked-prefill rows are sampled but their outputs are discarded.
+        # The parent's device-offset rollback cannot restore our CPU stream.
+        discarded_states = []
+        for row in self.discard_request_indices.np[: self.num_discarded_requests]:
+            generator = self.input_batch.generators.get(int(row))
+            if generator is not None:
+                cpu_generator = _get_cpu_generator_310p(generator)
+                discarded_states.append((cpu_generator, cpu_generator.get_state(), generator, generator.get_state()))
+        try:
+            return super()._sample(logits, spec_decode_metadata)
+        finally:
+            for cpu_generator, cpu_state, generator, device_state in discarded_states:
+                cpu_generator.set_state(cpu_state)
+                generator.set_state(device_state)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         kv_cache_specs = super().get_kv_cache_spec()

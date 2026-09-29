@@ -30,20 +30,20 @@ class BlockTable(AscendBlockTable):
         unavailable on 310P while keeping the corrected positions on device.
         """
         if req_indices.device.type == "cpu" or positions.device.type == "cpu":
-            raise TypeError(
-                "compute_slot_mapping_device expects device req_indices and positions"
-            )
+            raise TypeError("compute_slot_mapping_device expects device req_indices and positions")
         if req_indices.device != positions.device:
-            raise ValueError(
-                "req_indices and positions must be on the same device"
-            )
+            raise ValueError("req_indices and positions must be on the same device")
 
         slot_mapping = self._compute_slot_mapping_torch(
             req_indices,
             positions,
         )
-        self.slot_mapping.gpu[: positions.shape[0]].copy_(
-            slot_mapping.to(dtype=self.slot_mapping.gpu.dtype)
+        # On 310P a short D2D slice copy may overwrite its 32-byte-aligned
+        # tail. Index the full allocation so untouched/padded slots survive.
+        self.slot_mapping.gpu.index_copy_(
+            0,
+            torch.arange(positions.shape[0], dtype=torch.int64, device=positions.device),
+            slot_mapping.to(dtype=self.slot_mapping.gpu.dtype),
         )
 
     def _compute_slot_mapping_torch(
@@ -65,24 +65,14 @@ class BlockTable(AscendBlockTable):
         if total_cp_world_size > 1:
             virtual_block_size = self.block_size * total_cp_world_size
             logical_block_idx = positions_i32 // virtual_block_size
-            block_table_indices = (
-                req_indices_i32 * row_stride + logical_block_idx
-            ).to(torch.int64)
+            block_table_indices = (req_indices_i32 * row_stride + logical_block_idx).to(torch.int64)
             block_numbers = self.block_table.gpu.flatten()[block_table_indices]
             virtual_block_offsets = positions_i32 % virtual_block_size
             current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
-            mask = (
-                virtual_block_offsets
-                // self.cp_kv_cache_interleave_size
-                % total_cp_world_size
-                == current_rank
-            )
+            mask = virtual_block_offsets // self.cp_kv_cache_interleave_size % total_cp_world_size == current_rank
             block_offsets = (
                 virtual_block_offsets
-                // (
-                    total_cp_world_size
-                    * self.cp_kv_cache_interleave_size
-                )
+                // (total_cp_world_size * self.cp_kv_cache_interleave_size)
                 * self.cp_kv_cache_interleave_size
                 + virtual_block_offsets % self.cp_kv_cache_interleave_size
             )
@@ -94,9 +84,7 @@ class BlockTable(AscendBlockTable):
             )
         else:
             logical_block_idx = positions_i32 // self.block_size
-            block_table_indices = (
-                req_indices_i32 * row_stride + logical_block_idx
-            ).to(torch.int64)
+            block_table_indices = (req_indices_i32 * row_stride + logical_block_idx).to(torch.int64)
             block_numbers = self.block_table.gpu.flatten()[block_table_indices]
             block_offsets = positions_i32 % self.block_size
             slot_mapping = block_numbers * self.block_size + block_offsets

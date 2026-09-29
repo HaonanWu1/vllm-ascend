@@ -2865,7 +2865,7 @@ class NPUModelRunner(GPUModelRunner):
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
             if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
-                max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
+                max_topk = self.input_batch.top_k_cpu[: self.input_batch.num_reqs].max()
                 self.sampler.prepare_sampling(max_topk)
             return self.sampler(
                 logits=logits,
@@ -2875,7 +2875,7 @@ class NPUModelRunner(GPUModelRunner):
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
-            max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
+            max_topk = self.input_batch.top_k_cpu[: self.input_batch.num_reqs].max()
             self.rejection_sampler.prepare_sampling(max_topk)
         draft_probs = (
             self._get_spec_decode_draft_probs(spec_decode_metadata)
@@ -2912,7 +2912,9 @@ class NPUModelRunner(GPUModelRunner):
         discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
-            if gen is not None:
+            if gen is not None and get_ascend_device_type() != AscendDeviceType._310P:
+                # 310P restores both CPU and device RNG snapshots in _sample;
+                # its CPU exponential draw does not advance the device by 4.
                 gen.set_offset(gen.get_offset() - 4)
 
         # Copy some objects so they don't get modified after returning.
