@@ -92,6 +92,14 @@ class TestSampler310pStandalone(unittest.TestCase):
         sampler_310p._CPU_GENERATOR_CACHE_310P.clear()
 
     def test_random_sample_310p_reuse_cpu_generator_cache(self):
+        """功能：同一请求连续采样复用 CPU Generator，不按轮次重建随机流。
+
+        输入：两行概率接口替身、row1 的同一请求 Generator，初始 state=b"state"。
+        输出：只创建一次 CPU Generator，两次 row1 填充使用同一缓存对象；
+        初始状态被导入且不调用 seed 回退，每轮消费前各等待一次填充流。
+        场景：请求身份不变时保持缓存连续性。概率缓冲、设备流和 Generator
+        为边界替身；此项验证缓存与同步调用，真实随机序列由 RNG 数值用例验证。
+        """
         sampler_310p._CPU_GENERATOR_CACHE_310P.clear()
         probs = MagicMock()
         probs.div_.return_value = probs
@@ -129,16 +137,23 @@ class TestSampler310pStandalone(unittest.TestCase):
             sampler_310p._random_sample_310p(probs, generators)
 
         self.assertEqual(gen_ctor.call_count, 1)
-        self.assertIn(1, sampler_310p._CPU_GENERATOR_CACHE_310P)
-        cached_cpu_generator, source_generator_id = sampler_310p._CPU_GENERATOR_CACHE_310P[1]
+        self.assertIn(generator, sampler_310p._CPU_GENERATOR_CACHE_310P)
+        cached_cpu_generator = sampler_310p._CPU_GENERATOR_CACHE_310P[generator]
         self.assertIs(fake_q_first.rows[1].generators[0], cached_cpu_generator)
         self.assertIs(fake_q_second.rows[1].generators[0], cached_cpu_generator)
-        self.assertEqual(source_generator_id, id(generator))
         self.assertEqual(cached_cpu_generator.state, b"state")
         self.assertIsNone(cached_cpu_generator.seed)
         self.assertEqual(npu_stream.wait_stream.call_count, 2)
 
     def test_random_sample_310p_fallback_to_initial_seed_when_set_state_failed(self):
+        """功能：设备 RNG 状态不能导入 CPU 时按请求初始 seed 创建随机流。
+
+        输入：单行概率接口替身，请求 state=b"state"、seed=1234；CPU
+        Generator.set_state 主动抛 RuntimeError，模拟两类设备状态格式不兼容。
+        输出：缓存 Generator 的 seed=1234，该对象用于 row0 填充，消费流等待一次。
+        场景：首次从 NPU Generator 初始化 CPU 随机流的兼容回退。
+        Generator、概率缓冲及设备流为替身；不把调用验证当作随机分布验证。
+        """
         sampler_310p._CPU_GENERATOR_CACHE_310P.clear()
         probs = MagicMock()
         probs.div_.return_value = probs
@@ -149,7 +164,7 @@ class TestSampler310pStandalone(unittest.TestCase):
         q_instances = iter([fake_q])
         npu_stream = MagicMock()
         generator = MagicMock()
-        generator.get_state.side_effect = RuntimeError("state read failed")
+        generator.get_state.return_value = b"state"
         generator.initial_seed.return_value = 1234
         generators = {0: generator}
 
@@ -176,13 +191,20 @@ class TestSampler310pStandalone(unittest.TestCase):
             sampler_310p.torch.npu.current_stream = MagicMock(return_value=npu_stream)
             sampler_310p._random_sample_310p(probs, generators)
 
-        cached_cpu_generator, source_generator_id = sampler_310p._CPU_GENERATOR_CACHE_310P[0]
-        self.assertEqual(source_generator_id, id(generator))
+        cached_cpu_generator = sampler_310p._CPU_GENERATOR_CACHE_310P[generator]
         self.assertEqual(cached_cpu_generator.seed, 1234)
         self.assertIs(fake_q.rows[0].generators[0], cached_cpu_generator)
         self.assertEqual(npu_stream.wait_stream.call_count, 1)
 
     def test_random_sample_310p_rebuild_cache_when_generator_identity_changes(self):
+        """功能：新请求复用旧 batch 行时获得独立的 CPU 随机流。
+
+        输入：row0 先后属于两个不同 Generator，状态分别为 state-1/state-2。
+        输出：创建两个不同 CPU Generator，各自导入对应状态；新请求的缓存
+        指向第二个对象，不能沿用占据过同一行的旧请求状态。
+        场景：请求退出后槽位重用。概率缓冲、Generator 和设备流为边界替身；
+        本例检查身份隔离，实际随机序列的换行与生命周期由真实 tensor UT 验证。
+        """
         sampler_310p._CPU_GENERATOR_CACHE_310P.clear()
         probs = MagicMock()
         probs.div_.return_value = probs
@@ -228,9 +250,8 @@ class TestSampler310pStandalone(unittest.TestCase):
         self.assertIsNot(first_cpu_generator, second_cpu_generator)
         self.assertEqual(first_cpu_generator.state, b"state-1")
         self.assertEqual(second_cpu_generator.state, b"state-2")
-        cached_cpu_generator, source_generator_id = sampler_310p._CPU_GENERATOR_CACHE_310P[0]
+        cached_cpu_generator = sampler_310p._CPU_GENERATOR_CACHE_310P[generator_second]
         self.assertIs(cached_cpu_generator, second_cpu_generator)
-        self.assertEqual(source_generator_id, id(generator_second))
 
     def test_fill_cpu_exponential_310p_moves_has_draft_mask_to_cpu(self):
         """Regression: NPU has_draft_mask must be moved to CPU before torch.where."""

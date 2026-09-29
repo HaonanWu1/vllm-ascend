@@ -60,27 +60,51 @@ class TestAscendUnquantizedLinearMethod(TestBase):
         type(self.layer.weight.data).is_meta = mock_is_meta
         self.layer.precast_fp32_weight = False
 
+    @patch("vllm_ascend.utils.is_310p", return_value=False)
     @patch("vllm_ascend.utils.get_ascend_config")
     @mock.patch("torch_npu.npu_format_cast")
-    def test_process_weights_after_loading_with_nz0(self, mock_format_cast, mock_get_config):
+    def test_process_weights_after_loading_with_nz0(self, mock_format_cast, mock_get_config, _hardware_identity):
+        """T01：非310P关闭NZ模式时跳过权重格式转换。
+
+        输入：显式非310P身份、FP16非meta权重接口替身、weight_nz_mode=0。
+        输出：真实process_weights_after_loading执行后不调用npu_format_cast。
+        场景：公共平台的关闭分支不被310P默认策略影响；仅验证host分发，
+        权重接口、设备格式转换和配置为替身，不验证NZ存储或矩阵乘数值。
+        """
         mock_config = MagicMock()
         mock_config.weight_nz_mode = 0
         mock_get_config.return_value = mock_config
         self.method.process_weights_after_loading(self.layer)
         mock_format_cast.assert_not_called()
 
+    @patch("vllm_ascend.utils.is_310p", return_value=False)
     @patch("vllm_ascend.utils.get_ascend_config")
     @mock.patch("torch_npu.npu_format_cast")
-    def test_process_weights_after_loading_with_nz1(self, mock_format_cast, mock_get_config):
+    def test_process_weights_after_loading_with_nz1(self, mock_format_cast, mock_get_config, _hardware_identity):
+        """T01：非310P的NZ模式1不转换未量化FP16权重。
+
+        输入：显式非310P身份、FP16非meta权重接口替身、weight_nz_mode=1。
+        输出：真实process_weights_after_loading执行后不调用npu_format_cast。
+        场景：仅量化权重启用NZ时，未量化层保持原分支；不依赖测试机型号。
+        权重接口、设备转换和配置为替身，只验证策略，不验证NZ数值。
+        """
         mock_config = MagicMock()
         mock_config.weight_nz_mode = 1
         mock_get_config.return_value = mock_config
         self.method.process_weights_after_loading(self.layer)
         mock_format_cast.assert_not_called()
 
+    @patch("vllm_ascend.utils.is_310p", return_value=False)
     @patch("vllm_ascend.utils.get_ascend_config")
     @mock.patch("torch_npu.npu_format_cast")
-    def test_process_weights_after_loading_with_nz2(self, mock_format_cast, mock_get_config):
+    def test_process_weights_after_loading_with_nz2(self, mock_format_cast, mock_get_config, _hardware_identity):
+        """T01：非310P的NZ模式2对未量化FP16权重启用转换。
+
+        输入：显式非310P身份、FP16非meta权重接口替身、weight_nz_mode=2。
+        输出：真实process_weights_after_loading恰好调用一次npu_format_cast。
+        场景：全部权重启用NZ的公共平台分支；权重接口、配置及设备转换
+        为替身，只验证host接线，真实设备布局和数值由NPU用例另行验证。
+        """
         mock_config = MagicMock()
         mock_config.weight_nz_mode = 2
         mock_get_config.return_value = mock_config
