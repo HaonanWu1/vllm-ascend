@@ -111,6 +111,8 @@ if not _npu_available:
     sys.modules["torch_npu"].npu_moe_gating_top_k_softmax = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_quant_matmul = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_rms_norm = MagicMock()  # type: ignore[attr-defined]
+    # Device boundary for host dispatch tests; numerical RMSNorm is checked on NPU.
+    sys.modules["torch_npu"].npu_add_rms_norm = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_swiglu = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_convert_weight_to_int4pack = MagicMock()  # type: ignore[attr-defined]
 

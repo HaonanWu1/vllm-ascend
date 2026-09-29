@@ -47,6 +47,7 @@ class TestNPUPlatform(TestBase):
     @staticmethod
     def mock_vllm_ascend_config():
         mock_ascend_config = MagicMock()
+        mock_ascend_config.ascend_log_path = None
         mock_ascend_config.xlite_graph_config.enabled = False
         mock_ascend_config.xlite_graph_config.full_mode = False
         mock_ascend_config.ascend_compilation_config.enable_npugraph_ex = False
@@ -63,6 +64,11 @@ class TestNPUPlatform(TestBase):
         return mock_ascend_config
 
     def setUp(self):
+        # Isolate global configuration from earlier tests; logging is disabled
+        # explicitly, not by interpreting an arbitrary MagicMock as a path.
+        self._config_patch = patch("vllm_ascend.ascend_config._ASCEND_CONFIG", self.mock_vllm_ascend_config())
+        self._config_patch.start()
+        self.addCleanup(self._config_patch.stop)
         self._enable_sp_patch = patch("vllm_ascend.utils.enable_sp", return_value=False)
         self._enable_sp_patch.start()
         self.platform = NPUPlatform()
@@ -85,8 +91,14 @@ class TestNPUPlatform(TestBase):
         self.assertTrue(self.platform.is_sleep_mode_available())
 
     @patch("vllm_ascend.utils.adapt_patch")
-    @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_with_parser(self, mock_quant_config, mock_adapt_patch):
+    def test_pre_register_and_update_with_parser(self, mock_adapt_patch):
+        """T01：量化参数首次注册时补充ascend选项。
+
+        输入：parser接口替身，--quantization已有choices=[awq,gptq]。
+        输出：choices包含ascend且长度为3；全局适配patch边界恰好调用一次。
+        场景：真实量化类导入与平台注册流程；只mock parser和外部patch，
+        保留真实量化基类，避免测试顺序造成假的继承/注册行为。
+        """
         mock_parser = MagicMock()
         mock_action = MagicMock()
         mock_action.choices = ["awq", "gptq"]
@@ -100,15 +112,27 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(len(mock_action.choices), 3)  # original 2 + ascend
 
     @patch("vllm_ascend.utils.adapt_patch")
-    @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_without_parser(self, mock_quant_config, mock_adapt_patch):
+    def test_pre_register_and_update_without_parser(self, mock_adapt_patch):
+        """T01：无命令行parser时仍可初始化平台。
+
+        输入：parser=None，外部全局适配patch使用替身。
+        输出：真实pre_register_and_update不抛异常，patch以is_global_patch=True
+        恰好调用一次；真实量化模块导入，不替换其注册基类。
+        场景：程序化初始化未创建parser时，不应访问None的action属性。
+        """
         self.platform.pre_register_and_update(None)
 
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
 
     @patch("vllm_ascend.utils.adapt_patch")
-    @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_with_parser_no_quant_action(self, mock_quant_config, mock_adapt_patch):
+    def test_pre_register_and_update_with_parser_no_quant_action(self, mock_adapt_patch):
+        """T01：parser缺少量化参数时允许完成平台注册。
+
+        输入：parser接口替身的_option_string_actions为空字典。
+        输出：真实注册函数不抛异常，外部patch以is_global_patch=True调用一次。
+        场景：精简parser未声明--quantization；真实量化类导入，只有parser
+        与外部patch为替身。本例不验证完整CLI解析或模型量化数值。
+        """
         mock_parser = MagicMock()
         mock_parser._option_string_actions = {}
 
@@ -117,8 +141,14 @@ class TestNPUPlatform(TestBase):
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
 
     @patch("vllm_ascend.utils.adapt_patch")
-    @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_with_existing_ascend_quant(self, mock_quant_config, mock_adapt_patch):
+    def test_pre_register_and_update_with_existing_ascend_quant(self, mock_adapt_patch):
+        """T01：已有ascend量化选项时注册保持幂等。
+
+        输入：parser接口替身，--quantization已有choices=[awq,ascend]。
+        输出：注册后choices长度仍为2，外部全局适配patch恰好调用一次。
+        场景：平台重复接入同一parser不能重复追加选项；保留真实量化类
+        导入，仅mock parser和外部patch，不把调用检查当作量化功能测试。
+        """
         mock_parser = MagicMock()
         mock_action = MagicMock()
         mock_action.choices = ["awq", ASCEND_QUANTIZATION_METHOD]
@@ -781,14 +811,10 @@ class TestNPUPlatform(TestBase):
         vllm_config.parallel_config.prefill_context_parallel_size = 1
 
         with self.assertLogs(logger="vllm", level="WARNING") as logs:
-            self.platform._disable_unsupported_310p_cp_async_dflash(
-                vllm_config
-            )
+            self.platform._disable_unsupported_310p_cp_async_dflash(vllm_config)
 
         self.assertFalse(vllm_config.scheduler_config.async_scheduling)
-        self.assertTrue(
-            any("context parallelism" in message for message in logs.output)
-        )
+        self.assertTrue(any("context parallelism" in message for message in logs.output))
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
@@ -849,7 +875,15 @@ class TestNPUPlatform(TestBase):
         self.platform.check_and_update_config(vllm_config)
         self.assertEqual(vllm_config.compilation_config.custom_ops, [])
 
-    def test_get_attn_backend_cls_use_v1_and_mla(self):
+    @patch("vllm_ascend.platform.is_310p", return_value=False)
+    def test_get_attn_backend_cls_use_v1_and_mla(self, _hardware_identity):
+        """T01：公共平台MLA配置选择MLA attention backend。
+
+        输入：显式非310P身份，FP16、block128、use_mla=True、use_sparse=False。
+        输出：完整类路径vllm_ascend.attention.mla_v1.AscendMLABackend。
+        场景：310P特化不应改变公共MLA分支；仅替换硬件身份查询，执行真实
+        backend选择函数，不宣称执行了MLA设备算子。
+        """
         attn_selector_config = AttentionSelectorConfig(
             dtype=torch.float16,
             head_size=0,
@@ -861,7 +895,15 @@ class TestNPUPlatform(TestBase):
         result = self.platform.get_attn_backend_cls("ascend", attn_selector_config)
         self.assertEqual(result, "vllm_ascend.attention.mla_v1.AscendMLABackend")
 
-    def test_get_attn_backend_cls_use_v1_only(self):
+    @patch("vllm_ascend.platform.is_310p", return_value=False)
+    def test_get_attn_backend_cls_use_v1_only(self, _hardware_identity):
+        """T01：公共平台普通attention选择通用backend。
+
+        输入：显式非310P身份，FP16、block128、use_mla=False、use_sparse=False。
+        输出：完整类路径vllm_ascend.attention.attention_v1.AscendAttentionBackend。
+        场景：在310P测试机上也明确验证公共分支；仅硬件身份查询为替身，
+        backend分发真实执行，本例不验证attention算子的数值结果。
+        """
         attn_selector_config = AttentionSelectorConfig(
             dtype=torch.float16,
             head_size=0,

@@ -251,13 +251,29 @@ class TestAscendModelSlimConfig(TestBase):
             self.assertIn("config.json", error_msg)
 
     def test_maybe_update_config_non_directory_raises(self):
+        """输入：不存在的本地路径，HF下载边界明确报告文件不存在。
+
+        输出：真实get_model_file返回缺失，maybe_update_config抛含明确诊断的ValueError。
+        场景：UT原来会访问公网并反复等待超时；仅替换HF I/O及provider配置，
+        不替换本项目文件查找、异常处理或错误消息生成；配置内容应保持空。
+        """
         config = AscendModelSlimConfig()
 
-        with self.assertRaises(ValueError) as ctx:
+        with (
+            patch("vllm_ascend.quantization.utils.envs.VLLM_USE_MODELSCOPE", False),
+            patch(
+                "huggingface_hub.hf_hub_download", side_effect=FileNotFoundError("fixture: missing file")
+            ) as download,
+            self.assertRaises(ValueError) as ctx,
+        ):
             config.maybe_update_config("not_a_real_directory_path")
 
         error_msg = str(ctx.exception)
         self.assertIn("ModelSlim Quantization Config Not Found", error_msg)
+        download.assert_called_once_with(
+            repo_id="not_a_real_directory_path", filename="quant_model_description.json", revision=None
+        )
+        self.assertEqual(config.quant_description, {})
 
     def test_apply_extra_quant_adaptations_shared_head(self):
         config = AscendModelSlimConfig()
