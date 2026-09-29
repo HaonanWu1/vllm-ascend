@@ -428,7 +428,7 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
         # addresses, so every call in each configured mode must refresh them
         # from the current logical positions.
         query_descriptor_tokens = descriptor_tokens
-        if uses_hybrid_graph:
+        if uses_hybrid_graph or uses_piecewise:
             max_query_tokens = getattr(self, "max_query_tokens", None)
             if isinstance(max_query_tokens, int) and max_query_tokens > 0:
                 query_descriptor_tokens = min(
